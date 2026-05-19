@@ -93,6 +93,38 @@ _LLM_CACHE_KEY: Optional[Tuple[str, Tuple[Tuple[str, Any], ...]]] = None
 _HF_CLIENT: Optional[InferenceClient] = None  # type: ignore[assignment]
 
 
+def _emit_llm_metric(fn_name: str, *args, **kwargs) -> None:
+    """Best-effort Prometheus emission for LLM provider calls."""
+    try:
+        from observability import metrics as backend_metrics  # type: ignore
+        fn = getattr(backend_metrics, fn_name)
+    except Exception:
+        return
+    try:
+        fn(*args, **kwargs)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _classify_error(exc: BaseException) -> str:
+    """Classify a provider exception for the llm_provider_failures_total label."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            status = getattr(resp, "status_code", None)
+    if status == 429:
+        return "429"
+    if isinstance(status, int) and 500 <= status < 600:
+        return "5xx"
+    name = type(exc).__name__.lower()
+    if "timeout" in name:
+        return "timeout"
+    if "connect" in name:
+        return "connection"
+    return "other"
+
+
 def _parse_retry_after(value: Any) -> Optional[float]:
     """Parse a Retry-After header value (seconds or HTTP-date) into float seconds."""
     if value is None:
@@ -295,6 +327,7 @@ def _call_mercury_api(prompt: str, params: Dict[str, Any]) -> str:
     attempts = REMOTE_MAX_ATTEMPTS
     delay = REMOTE_BACKOFF_START
     last_exc: Exception | None = None
+    call_start = time.perf_counter()
     for attempt in range(1, attempts + 1):
         try:
             if REMOTE_MIN_DELAY > 0 and attempt > 1:
@@ -311,8 +344,10 @@ def _call_mercury_api(prompt: str, params: Dict[str, Any]) -> str:
             data = response.json()
             if "choices" in data and data["choices"]:
                 message = data["choices"][0].get("message", {})
+                _emit_llm_metric("observe_llm_call", "mercury", "success", time.perf_counter() - call_start)
                 return (message.get("content") or "").strip()
             if "content" in data:
+                _emit_llm_metric("observe_llm_call", "mercury", "success", time.perf_counter() - call_start)
                 return (data["content"] or "").strip()
             raise RuntimeError(f"Unexpected response format from Mercury API: {data}")
         except Exception as exc:
@@ -348,6 +383,13 @@ def _call_mercury_api(prompt: str, params: Dict[str, Any]) -> str:
             time.sleep(delay)
             delay *= REMOTE_BACKOFF
 
+    _emit_llm_metric(
+        "observe_llm_call",
+        "mercury",
+        "error",
+        time.perf_counter() - call_start,
+        _classify_error(last_exc) if last_exc else "other",
+    )
     raise RuntimeError("Mercury API failed after multiple attempts.") from last_exc
 
 
@@ -384,12 +426,13 @@ def _call_groq_api(prompt: str, params: Dict[str, Any]) -> str:
     attempts = REMOTE_MAX_ATTEMPTS
     delay = REMOTE_BACKOFF_START
     last_exc: Exception | None = None
+    call_start = time.perf_counter()
 
     for attempt in range(1, attempts + 1):
         try:
             if REMOTE_MIN_DELAY > 0 and attempt > 1:
                 time.sleep(REMOTE_MIN_DELAY)
-            
+
             # Groq uses standard OpenAI-compatible endpoint structure
             response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -401,6 +444,7 @@ def _call_groq_api(prompt: str, params: Dict[str, Any]) -> str:
             data = response.json()
             if "choices" in data and data["choices"]:
                 message = data["choices"][0].get("message", {})
+                _emit_llm_metric("observe_llm_call", "groq", "success", time.perf_counter() - call_start)
                 return (message.get("content") or "").strip()
             raise RuntimeError(f"Unexpected response format from Groq API: {data}")
             
@@ -424,6 +468,13 @@ def _call_groq_api(prompt: str, params: Dict[str, Any]) -> str:
             if attempt == attempts:
                 break
 
+    _emit_llm_metric(
+        "observe_llm_call",
+        "groq",
+        "error",
+        time.perf_counter() - call_start,
+        _classify_error(last_exc) if last_exc else "other",
+    )
     raise RuntimeError("Groq API failed after multiple attempts.") from last_exc
 
 
@@ -453,6 +504,7 @@ def _call_openai_api(prompt: str, params: Dict[str, Any]) -> str:
     attempts = REMOTE_MAX_ATTEMPTS
     delay = REMOTE_BACKOFF_START
     last_exc: Exception | None = None
+    call_start = time.perf_counter()
     for attempt in range(1, attempts + 1):
         try:
             response = client.chat.completions.create(
@@ -463,6 +515,7 @@ def _call_openai_api(prompt: str, params: Dict[str, Any]) -> str:
                 top_p=params.get("top_p"),
                 timeout=REMOTE_TIMEOUT,
             )
+            _emit_llm_metric("observe_llm_call", "openai", "success", time.perf_counter() - call_start)
             return (response.choices[0].message.content or "").strip()
         except Exception as exc:
             last_exc = exc
@@ -499,6 +552,13 @@ def _call_openai_api(prompt: str, params: Dict[str, Any]) -> str:
             delay *= REMOTE_BACKOFF
 
     logger.error("OpenAI API call failed after %s attempts: %s", attempts, last_exc)
+    _emit_llm_metric(
+        "observe_llm_call",
+        "openai",
+        "error",
+        time.perf_counter() - call_start,
+        _classify_error(last_exc) if last_exc else "other",
+    )
     raise RuntimeError("OpenAI API failed after multiple attempts.") from last_exc
 
 

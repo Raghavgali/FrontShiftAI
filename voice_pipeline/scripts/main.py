@@ -57,6 +57,17 @@ from voice_pipeline.utils.wandb_logger import WandbLogger
 
 from voice_pipeline.utils.logger import setup_logging
 
+# Phase 7B: start the Prometheus /metrics server for this worker. Safe to
+# import even if prometheus_client isn't installed — the observability
+# module itself doesn't fail at import time, only start_metrics_server() does.
+try:
+    from voice_pipeline.observability.metrics import start_metrics_server
+    start_metrics_server()
+except Exception:  # noqa: BLE001
+    # Metrics are strictly additive; a missing dependency should never
+    # prevent the voice worker from starting.
+    pass
+
 load_dotenv(dotenv_path=Path(__file__).parent / '.env')
 CONFIG = load_voice_config()
 

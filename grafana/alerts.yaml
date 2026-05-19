@@ -1,0 +1,101 @@
+# Phase 7G — Grafana alert rules.
+#
+# Format is Prometheus-compatible (Grafana Cloud ingests this directly under
+# "Alerting > Alert rules > Import"). Every rule names the SLO or operational
+# concern it backs so when an alert fires the runbook link is obvious.
+#
+# Notification routing is intentionally *not* declared here — Grafana Cloud
+# owns the contact-points/routes UI; these rules just declare the firing
+# conditions. Expected annotations on each rule: summary, runbook_url
+# (once a runbook doc exists), and the relevant SLO name.
+
+groups:
+  - name: voice-latency
+    interval: 30s
+    rules:
+      - alert: VoiceP95LatencyBreach
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(voice_e2e_latency_seconds_bucket[5m]))) > 1.5
+        for: 5m
+        labels:
+          severity: warning
+          slo: voice_p95_latency
+        annotations:
+          summary: "Voice p95 > 1.5s for 5m"
+          description: |
+            End-to-end voice turn p95 has exceeded the 1.5s SLO target
+            for 5 minutes. Check the voice_pipeline dashboard's per-stage
+            breakdown (VAD / STT / LLM TTFT / TTS TTFB) to localize.
+
+  - name: chat-latency
+    interval: 30s
+    rules:
+      - alert: ChatP95LatencyBreach
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (
+              rate(http_request_duration_seconds_bucket{endpoint="/api/chat/message"}[5m])
+            )) > 2.5
+        for: 10m
+        labels:
+          severity: warning
+          slo: chat_p95_latency
+
+  - name: resilience
+    interval: 30s
+    rules:
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_state == 2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker open for {{ $labels.key }} > 2m"
+          description: |
+            Provider is durably unhealthy. Expect the fallback chain to
+            absorb traffic. Verify the next-hop provider isn't also
+            degrading on the rag_pipeline dashboard.
+
+      - alert: LLMProviderFailureSpike
+        # >10% of calls to any provider failing over 5 minutes.
+        expr: |
+          sum by (provider) (rate(llm_provider_failures_total[5m]))
+          /
+          sum by (provider) (rate(llm_provider_latency_seconds_count[5m]))
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+
+  - name: tenancy
+    interval: 30s
+    rules:
+      - alert: TenantErrorRateHigh
+        # Per-tenant 5xx rate > 10% over 5 minutes — catches a single
+        # company's corpus/auth/flag issue without needing to watch
+        # each tenant individually.
+        expr: |
+          sum by (company) (rate(http_requests_total{status="5xx"}[5m]))
+          /
+          sum by (company) (rate(http_requests_total[5m]))
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tenant {{ $labels.company }} error rate > 10%"
+
+  - name: infra
+    interval: 30s
+    rules:
+      - alert: DbPoolSaturation
+        # Fires when checked-out connections stay above 80% of pool size.
+        # Pool metrics get populated in Phase 6C (QueuePool) — this rule
+        # is inert until then, which is fine.
+        expr: db_pool_checkedout / db_pool_size > 0.8
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DB connection pool > 80% saturated"

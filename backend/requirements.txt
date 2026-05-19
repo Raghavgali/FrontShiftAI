@@ -56,3 +56,4 @@ redis>=5.0.0
 
 # Monitoring
 wandb>=0.16.0
+prometheus_client>=0.20.0

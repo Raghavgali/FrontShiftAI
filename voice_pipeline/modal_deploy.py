@@ -32,6 +32,7 @@ voice_agent_image = (
         "uvicorn>=0.30.0",
         "httpx>=0.24.0",
         "wandb>=0.15.0",
+        "prometheus_client>=0.20.0",
         "pyyaml>=6.0",
     )
     .add_local_dir(

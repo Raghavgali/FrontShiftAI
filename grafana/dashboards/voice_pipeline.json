@@ -1,0 +1,73 @@
+{
+  "uid": "fsai-voice-pipeline",
+  "title": "FrontShiftAI — Voice Pipeline",
+  "tags": ["frontshiftai", "voice"],
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus",
+        "current": {"text": "Prometheus", "value": "Prometheus"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries",
+      "title": "End-to-end voice turn — p50 / p95 / p99",
+      "description": "End-of-speech → first TTS byte. p95 is the SLO number (target <1.5s).",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(voice_e2e_latency_seconds_bucket[5m])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(voice_e2e_latency_seconds_bucket[5m])))", "legendFormat": "p95", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(voice_e2e_latency_seconds_bucket[5m])))", "legendFormat": "p99", "refId": "C"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "thresholds": {"mode": "absolute", "steps": [
+        {"color": "green", "value": null}, {"color": "yellow", "value": 1.2}, {"color": "red", "value": 1.5}
+      ]}}}
+    },
+    {
+      "id": 2, "type": "timeseries",
+      "title": "Per-stage p95 latency",
+      "description": "Bottleneck localization — when the E2E p95 spikes, look here to see which stage absorbed it.",
+      "gridPos": {"x": 0, "y": 9, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(voice_vad_eou_delay_seconds_bucket[5m])))", "legendFormat": "VAD EOU", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le,provider) (rate(voice_stt_duration_seconds_bucket[5m])))", "legendFormat": "STT — {{provider}}", "refId": "B"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(voice_llm_ttft_seconds_bucket[5m])))", "legendFormat": "LLM TTFT", "refId": "C"},
+        {"expr": "histogram_quantile(0.95, sum by (le,provider) (rate(voice_tts_ttfb_seconds_bucket[5m])))", "legendFormat": "TTS TTFB — {{provider}}", "refId": "D"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 3, "type": "stat",
+      "title": "Active sessions",
+      "gridPos": {"x": 0, "y": 18, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [{"expr": "sum(voice_session_active)", "refId": "A"}]
+    },
+    {
+      "id": 4, "type": "timeseries",
+      "title": "Tool call outcomes / sec",
+      "gridPos": {"x": 6, "y": 18, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (tool,outcome) (rate(voice_tool_calls_total[5m]))", "legendFormat": "{{tool}} — {{outcome}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries",
+      "title": "Session errors by source",
+      "gridPos": {"x": 18, "y": 18, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (source) (rate(voice_session_errors_total[5m]))", "legendFormat": "{{source}}", "refId": "A"}
+      ]
+    }
+  ]
+}

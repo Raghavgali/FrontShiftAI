@@ -1,0 +1,114 @@
+{
+  "uid": "fsai-service-health",
+  "title": "FrontShiftAI — Service Health (Four Golden Signals)",
+  "tags": ["frontshiftai", "golden-signals"],
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "hide": 0,
+        "current": {"text": "Prometheus", "value": "Prometheus"}
+      },
+      {
+        "name": "endpoint",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(http_requests_total, endpoint)",
+        "includeAll": true,
+        "multi": true,
+        "current": {"text": "All", "value": "$__all"},
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Traffic — requests / sec",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (endpoint) (rate(http_requests_total{endpoint=~\"$endpoint\"}[5m]))",
+         "legendFormat": "{{endpoint}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Errors — 5xx rate by endpoint",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (endpoint) (rate(http_requests_total{status=\"5xx\",endpoint=~\"$endpoint\"}[5m]))",
+         "legendFormat": "{{endpoint}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Latency — p50 / p95 / p99",
+      "gridPos": {"x": 0, "y": 8, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint=~\"$endpoint\"}[5m])))",
+         "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint=~\"$endpoint\"}[5m])))",
+         "legendFormat": "p95", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{endpoint=~\"$endpoint\"}[5m])))",
+         "legendFormat": "p99", "refId": "C"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Requests / min (last 5m)",
+      "gridPos": {"x": 0, "y": 17, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "60 * sum(rate(http_requests_total[5m]))", "refId": "A"}
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Error rate (5xx / total, 5m)",
+      "gridPos": {"x": 6, "y": 17, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(http_requests_total{status=\"5xx\"}[5m])) / sum(rate(http_requests_total[5m]))",
+         "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit"}}
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "DB pool checked out / size",
+      "gridPos": {"x": 12, "y": 17, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "db_pool_checkedout / db_pool_size", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit"}}
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Active voice sessions",
+      "gridPos": {"x": 18, "y": 17, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(voice_session_active)", "refId": "A"}
+      ]
+    }
+  ]
+}

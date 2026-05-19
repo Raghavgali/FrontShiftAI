@@ -1,0 +1,77 @@
+{
+  "uid": "fsai-rag-pipeline",
+  "title": "FrontShiftAI — RAG Pipeline",
+  "tags": ["frontshiftai", "rag"],
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "templating": {
+    "list": [
+      {"name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus",
+       "current": {"text": "Prometheus", "value": "Prometheus"}}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries",
+      "title": "Retrieval p95 (ChromaDB query latency)",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(rag_retrieval_duration_seconds_bucket[5m])))", "legendFormat": "p95 overall", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le,company) (rate(rag_retrieval_duration_seconds_bucket[5m])))", "legendFormat": "p95 — {{company}}", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 2, "type": "timeseries",
+      "title": "Generation p95 by backend",
+      "description": "Mercury / Groq / OpenAI compared head-to-head. Phase 1E makes voice use Groq primary — should show as the lowest line.",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le,backend) (rate(rag_generation_duration_seconds_bucket[5m])))", "legendFormat": "{{backend}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 3, "type": "stat",
+      "title": "Cache hit rate (5m)",
+      "gridPos": {"x": 0, "y": 9, "w": 6, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum(rate(rag_cache_hit_total{hit=\"1\"}[5m])) / sum(rate(rag_cache_hit_total[5m]))", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit"}}
+    },
+    {
+      "id": 4, "type": "timeseries",
+      "title": "Cache hits vs misses",
+      "gridPos": {"x": 6, "y": 9, "w": 18, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (hit) (rate(rag_cache_hit_total[5m]))", "legendFormat": "hit={{hit}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries",
+      "title": "LLM provider latency (all outcomes)",
+      "gridPos": {"x": 0, "y": 15, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le,provider) (rate(llm_provider_latency_seconds_bucket[5m])))", "legendFormat": "{{provider}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 6, "type": "timeseries",
+      "title": "LLM provider failures by class",
+      "gridPos": {"x": 12, "y": 15, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (provider,error_class) (rate(llm_provider_failures_total[5m]))", "legendFormat": "{{provider}} — {{error_class}}", "refId": "A"}
+      ]
+    }
+  ]
+}

@@ -40,6 +40,10 @@ from monitoring.middleware import MonitoringMiddleware
 from db.tenant_context import set_tenant_context, clear_tenant_context
 from api.auth import decode_access_token
 
+# Observability (Phase 7)
+from observability.metrics import prometheus_middleware, metrics_endpoint
+from observability.tracing import request_id_middleware, install_log_filter
+
 # Import ChromaDB setup from chat_pipeline
 from chat_pipeline.rag.data_loader import ensure_chroma_store, get_collection, _embedding_function
 import time
@@ -196,6 +200,33 @@ app.add_middleware(
 # MONITORING MIDDLEWARE
 # ----------------------------
 app.add_middleware(MonitoringMiddleware)
+
+
+# ----------------------------
+# OBSERVABILITY (Phase 7A + 7C)
+# ----------------------------
+# Order matters: FastAPI wraps middleware in reverse registration order, so
+# the *last* registered middleware runs *first* on the inbound path. We want
+# the request-id middleware to run first so every downstream log line sees
+# the ID, then the Prometheus middleware, then the tenant-context middleware
+# (so the Prometheus handler can read the company label).
+install_log_filter()
+
+
+@app.middleware("http")
+async def _prometheus_mw(request: Request, call_next):
+    return await prometheus_middleware(request, call_next)
+
+
+@app.middleware("http")
+async def _request_id_mw(request: Request, call_next):
+    return await request_id_middleware(request, call_next)
+
+
+@app.get("/metrics", include_in_schema=False)
+def _metrics():
+    """Prometheus scrape endpoint (plain text exposition format)."""
+    return metrics_endpoint()
 
 
 # ----------------------------

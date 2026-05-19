@@ -1,0 +1,70 @@
+{
+  "uid": "fsai-resilience",
+  "title": "FrontShiftAI — Resilience (Circuit Breakers + Retries)",
+  "tags": ["frontshiftai", "resilience"],
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {"name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus",
+       "current": {"text": "Prometheus", "value": "Prometheus"}}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries",
+      "title": "Circuit breaker state (0=closed, 1=half_open, 2=open)",
+      "description": "Any line at 2 for > 60s means traffic is being shed to fallback. Paired with the alert CircuitBreakerOpen.",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "circuit_breaker_state", "legendFormat": "{{key}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"min": 0, "max": 2, "thresholds": {"mode": "absolute", "steps": [
+        {"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 2}
+      ]}}}
+    },
+    {
+      "id": 2, "type": "timeseries",
+      "title": "LLM provider failure rate / sec by class",
+      "gridPos": {"x": 0, "y": 9, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (provider,error_class) (rate(llm_provider_failures_total[5m]))",
+         "legendFormat": "{{provider}} — {{error_class}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 3, "type": "timeseries",
+      "title": "LLM provider success ratio (rolling 5m)",
+      "description": "Inverse view of failures — easier to eyeball \"is provider X healthy right now?\"",
+      "gridPos": {"x": 12, "y": 9, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "1 - (sum by (provider) (rate(llm_provider_failures_total[5m])) / sum by (provider) (rate(llm_provider_latency_seconds_count[5m])))",
+         "legendFormat": "{{provider}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+    },
+    {
+      "id": 4, "type": "stat",
+      "title": "Currently open breakers",
+      "gridPos": {"x": 0, "y": 18, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "count(circuit_breaker_state == 2)", "refId": "A"}
+      ]
+    },
+    {
+      "id": 5, "type": "stat",
+      "title": "Currently half-open breakers",
+      "gridPos": {"x": 12, "y": 18, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "count(circuit_breaker_state == 1)", "refId": "A"}
+      ]
+    }
+  ]
+}

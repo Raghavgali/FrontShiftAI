@@ -34,6 +34,25 @@ RETRIEVER_REGISTRY = {
     "bm25": bm25_retrieval,
 }
 
+
+def _emit_rag_metric(fn_name: str, *args, **kwargs) -> None:
+    """Best-effort Prometheus emission.
+
+    The chat_pipeline package sits outside backend/ and must not hard-depend
+    on the backend's observability module — but when it is importable (the
+    FastAPI process), we want the metrics. Silently no-op otherwise (e.g.
+    when the pipeline is exercised from an evaluation CLI).
+    """
+    try:
+        from observability import metrics as backend_metrics  # type: ignore
+        fn = getattr(backend_metrics, fn_name)
+    except Exception:
+        return
+    try:
+        fn(*args, **kwargs)
+    except Exception:  # noqa: BLE001 - never let metrics break a pipeline call
+        pass
+
 RERANKER_REGISTRY = {
     "two_stage": two_stage_reranker,
     "cross_encoder": two_stage_reranker,  # alias for readability
@@ -304,6 +323,7 @@ class RAGPipeline:
                     cache_hit = True
             if cache_hit:
                 timings["cache_hit"] = 1.0
+                _emit_rag_metric("observe_rag_cache", company_name, True)
                 return PipelineResult(
                     answer=cached_answer,
                     metadata=cached_metadata_copy,
@@ -315,7 +335,11 @@ class RAGPipeline:
         start = time.perf_counter()
         self._validate_components(settings)
         docs, metadata = self._execute_retrieval(query, company_name, settings)
-        timings["retrieval"] = time.perf_counter() - start
+        retrieval_duration = time.perf_counter() - start
+        timings["retrieval"] = retrieval_duration
+        _emit_rag_metric("observe_rag_retrieval", company_name, retrieval_duration)
+        if use_cache:
+            _emit_rag_metric("observe_rag_cache", company_name, False)
 
         if not docs:
             return PipelineResult(
@@ -344,8 +368,13 @@ class RAGPipeline:
             metadatas=metadata,
         )
         backend_used = get_last_backend_used()
-        timings["generation"] = time.perf_counter() - gen_start
+        gen_duration = time.perf_counter() - gen_start
+        timings["generation"] = gen_duration
         timings["cache_hit"] = 1.0 if cache_hit else 0.0
+        if not effective_stream:
+            # Only record non-streaming generations; streamed paths accumulate
+            # differently and will be instrumented in Phase 2.
+            _emit_rag_metric("observe_rag_generation", backend_used, company_name, gen_duration)
 
         if use_cache and cache_key and not effective_stream and isinstance(answer, str):
             self._update_cache(cache_key, answer, metadata)

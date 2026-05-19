@@ -177,19 +177,25 @@ class CircuitBreaker:
 
     def allow(self) -> bool:
         """Check whether a call is permitted right now. Takes the lock."""
+        transitioned_to: Optional[BreakerState] = None
         with self._lock:
             if self._state is BreakerState.CLOSED:
-                return True
-            # OPEN or HALF_OPEN
-            if self._state is BreakerState.OPEN:
+                allowed = True
+            elif self._state is BreakerState.OPEN:
                 if time.time() - self._opened_at >= self.policy.recovery_timeout_s:
                     self._state = BreakerState.HALF_OPEN
+                    transitioned_to = BreakerState.HALF_OPEN
                     logger.info("circuit %s: OPEN → HALF_OPEN (probe)", self.key)
-                    return True
-                return False
-            # HALF_OPEN already — only one probe at a time. Downgrade back to
-            # OPEN; if the probe (currently in-flight) succeeds it'll close us.
-            return True
+                    allowed = True
+                else:
+                    allowed = False
+            else:
+                # HALF_OPEN already — only one probe at a time. Allow; if the
+                # probe (currently in-flight) succeeds it'll close us.
+                allowed = True
+        if transitioned_to is not None:
+            _publish_state(self.key, transitioned_to)
+        return allowed
 
     def record_success(self) -> None:
         with self._lock:
@@ -197,6 +203,7 @@ class CircuitBreaker:
                 logger.info("circuit %s: → CLOSED", self.key)
             self._state = BreakerState.CLOSED
             self._failures = 0
+        _publish_state(self.key, BreakerState.CLOSED)
 
     def record_failure(self) -> None:
         with self._lock:
@@ -208,6 +215,22 @@ class CircuitBreaker:
                     )
                 self._state = BreakerState.OPEN
                 self._opened_at = time.time()
+        _publish_state(self.key, self._state)
+
+
+def _publish_state(key: str, state: "BreakerState") -> None:
+    """Mirror breaker transitions into the Prometheus gauge.
+
+    Best-effort: if the observability module isn't importable (e.g. the
+    resilience module is being used from a context that doesn't load the
+    FastAPI app, like a unit test), we silently skip. The resilience
+    contract must not depend on Prometheus being present.
+    """
+    try:
+        from observability.metrics import set_circuit_breaker_state
+        set_circuit_breaker_state(key, state.value)
+    except Exception:  # noqa: BLE001 - never let metrics break a call path
+        pass
 
 
 _BREAKERS: Dict[str, CircuitBreaker] = {}

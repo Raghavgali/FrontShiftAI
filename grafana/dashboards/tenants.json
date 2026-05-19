@@ -1,0 +1,66 @@
+{
+  "uid": "fsai-tenants",
+  "title": "FrontShiftAI — Tenant Health (Noisy-Neighbor Detection)",
+  "tags": ["frontshiftai", "multi-tenant"],
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {"name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus",
+       "current": {"text": "Prometheus", "value": "Prometheus"}},
+      {
+        "name": "company", "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(http_requests_total, company)",
+        "includeAll": true, "multi": true,
+        "current": {"text": "All", "value": "$__all"}, "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries",
+      "title": "Requests / sec by tenant",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (company) (rate(http_requests_total{company=~\"$company\"}[5m]))", "legendFormat": "{{company}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 2, "type": "timeseries",
+      "title": "p95 latency by tenant",
+      "description": "A single tenant's p95 drifting while others stay flat usually means a corpus problem (e.g. a very large handbook blowing past top_k).",
+      "gridPos": {"x": 0, "y": 9, "w": 24, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le,company) (rate(http_request_duration_seconds_bucket{company=~\"$company\"}[5m])))",
+         "legendFormat": "{{company}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 3, "type": "timeseries",
+      "title": "Error rate by tenant (5xx)",
+      "gridPos": {"x": 0, "y": 18, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (company) (rate(http_requests_total{status=\"5xx\",company=~\"$company\"}[5m])) / sum by (company) (rate(http_requests_total{company=~\"$company\"}[5m]))",
+         "legendFormat": "{{company}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit"}}
+    },
+    {
+      "id": 4, "type": "barchart",
+      "title": "Agent mix per tenant (last 1h)",
+      "gridPos": {"x": 12, "y": 18, "w": 12, "h": 9},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "sum by (company,agent) (increase(tenant_request_total{company=~\"$company\"}[1h]))",
+         "legendFormat": "{{company}} — {{agent}}", "refId": "A"}
+      ]
+    }
+  ]
+}

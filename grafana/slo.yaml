@@ -1,0 +1,101 @@
+# Phase 7E — Service Level Objectives.
+#
+# SLOs are the promise: "X% of requests will satisfy Y within rolling window
+# Z." Alerting off raw thresholds produces noise ("one Tuesday was slow");
+# alerting off error-budget *burn rate* separates sustained degradation
+# from one-off blips. Burn-rate multipliers here follow Google SRE's
+# multi-window / multi-burn-rate recipe (2× 1-hour, 6× 6-hour, 14.4× 24-hour).
+#
+# Consumed by:
+#   - ``grafana/alerts.yaml`` (which translates SLOs into concrete alert
+#     rules) — the single source of target values lives here.
+#   - Phase 7 tests (``stress_tests/test_phase7_observability.py`` will
+#     assert that every SLO's indicator query returns a sane value).
+
+slos:
+  - name: voice_p95_latency
+    description: >-
+      95th-percentile end-to-end voice turn (end-of-speech → first TTS byte).
+      Drives the "sub-1.5s voice" product promise; the plan's Phase 1–5 work
+      optimizes specifically against this.
+    target_seconds: 1.5
+    indicator_query: |
+      histogram_quantile(0.95,
+        sum by (le) (rate(voice_e2e_latency_seconds_bucket[5m])))
+    window_days: 30
+    error_budget_pct: 0.5          # 0.5% of turns may exceed target
+    burn_rate_alerts: [1, 6, 14.4]
+
+  - name: chat_p95_latency
+    description: >-
+      95th-percentile latency for POST /api/chat/message. Chat tolerates
+      more than voice (different user expectation), but above p95 > 2.5s
+      users start bouncing.
+    target_seconds: 2.5
+    indicator_query: |
+      histogram_quantile(0.95,
+        sum by (le) (
+          rate(http_request_duration_seconds_bucket{endpoint="/api/chat/message"}[5m])
+        ))
+    window_days: 30
+    error_budget_pct: 0.5
+    burn_rate_alerts: [1, 6, 14.4]
+
+  - name: availability_per_tenant
+    description: >-
+      Per-tenant availability (non-5xx / total). Catches tenant-specific
+      degradation even if the global numbers look healthy — e.g. one
+      company's corpus hitting a retrieval cliff.
+    target: 0.995                   # 99.5% → ~3.6h budget per 30-day month
+    indicator_query: |
+      sum by (company) (rate(http_requests_total{status!~"5.."}[5m]))
+      /
+      sum by (company) (rate(http_requests_total[5m]))
+    window_days: 30
+    error_budget_pct: 0.5
+    burn_rate_alerts: [1, 6]
+
+  - name: rag_retrieval_p95
+    description: >-
+      95th-percentile ChromaDB retrieval. Should stay fast; if it drifts
+      that's usually the ``resolve_company_filter`` scan failing over to
+      the slow path (addressed by Phase 4A/B caching).
+    target_seconds: 0.5
+    indicator_query: |
+      histogram_quantile(0.95,
+        sum by (le) (rate(rag_retrieval_duration_seconds_bucket[5m])))
+    window_days: 30
+    error_budget_pct: 1.0
+
+  - name: llm_generation_p95_groq
+    description: >-
+      95th-percentile Groq generation time. Voice path uses Groq primary
+      (Phase 1E); if this slips past 800 ms the sub-1.5s voice SLO is
+      at risk before anything else.
+    target_seconds: 0.8
+    indicator_query: |
+      histogram_quantile(0.95,
+        sum by (le) (rate(rag_generation_duration_seconds_bucket{backend="groq"}[5m])))
+    window_days: 30
+    error_budget_pct: 1.0
+
+  - name: voice_session_creation_p95
+    description: >-
+      95th-percentile time from POST /session → LiveKit token returned.
+      Warm path should be well under 3 s; cold start budget is 8 s
+      (Modal container spawn).
+    target_seconds: 3.0
+    indicator_query: |
+      histogram_quantile(0.95,
+        sum by (le) (rate(http_request_duration_seconds_bucket{endpoint=~".*/session"}[5m])))
+    window_days: 30
+    error_budget_pct: 1.0
+
+  - name: circuit_breaker_recovery
+    description: >-
+      Time from an open breaker → first successful probe (half-open →
+      closed). This is operational, not an SLO in the budget sense:
+      we alert if a breaker stays open longer than 2×recovery_timeout
+      (meaning the provider is durably down).
+    operational: true
+    max_open_seconds: 120
