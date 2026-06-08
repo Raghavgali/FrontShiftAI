@@ -7,7 +7,9 @@ from db.connection import SessionLocal
 
 router = APIRouter()
 
-@router.get("/health")
+# Cloud Run, GCE load balancers, and many monitoring probes send HEAD
+# on liveness checks. Accepting both methods avoids spurious 405s in logs.
+@router.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     """Health check for Cloud Run and monitoring"""
     try:
@@ -31,7 +33,7 @@ async def health_check():
         )
 
 
-@router.get("/health/ready")
+@router.api_route("/health/ready", methods=["GET", "HEAD"])
 async def readiness_check():
     """
     Readiness check - verifies that RAG models are loaded and ready

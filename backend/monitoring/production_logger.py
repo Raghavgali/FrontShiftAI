@@ -38,20 +38,24 @@ class ProductionMonitor:
     def _initialize_wandb(self):
         """Initialize WANDB for production monitoring"""
         try:
-            # Smart project selection
-            # 1. Use WANDB_PRODUCTION_PROJECT if set
-            # 2. Default to FrontShiftAI_Production (Production/Realtime traffic)
-            # Note: Agent evaluations use a separate logger (WandbLogger) that targets FrontShiftAI_Agents
             project_name = os.getenv("WANDB_PRODUCTION_PROJECT", "FrontShiftAI_Production")
             env_type = os.getenv("ENVIRONMENT", "development")
 
+            # Default to the authed user's own entity (let wandb pick) instead
+            # of hardcoding the old team's entity. The original group9mlops
+            # entity is no longer writable from this account.
+            entity = os.getenv("WANDB_ENTITY") or None
+
             self.run = wandb.init(
                 project=project_name,
-                entity=os.getenv("WANDB_ENTITY", "group9mlops-northeastern-university"),
+                entity=entity,
                 name=f"{env_type}-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
                 job_type="production-monitoring",
                 tags=[env_type, "monitoring"],
-                reinit=True
+                # Phase-7 cleanup: reinit=True is deprecated in wandb>=0.18.
+                # "finish_previous" matches the old boolean-True behavior
+                # (close any active run before starting a new one).
+                reinit="finish_previous",
             )
             print(f"✅ Production monitoring initialized with WANDB (Project: {project_name})")
         except Exception as e:

@@ -5,6 +5,7 @@ Main entry point for the backend API
 import os
 import sys
 import logging
+import warnings
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -13,6 +14,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import uvicorn
+
+
+# Silence noisy upstream deprecation warnings we can't fix at our layer.
+# langgraph's checkpoint.base imports trigger a LangChainPendingDeprecationWarning
+# about ``allowed_objects`` from JsonPlusSerializer — internal to the lib;
+# our code never touches that serializer directly.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*allowed_objects.*will change in a future version.*",
+)
 
 # Load environment variables
 load_dotenv()

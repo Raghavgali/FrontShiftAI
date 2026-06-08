@@ -232,7 +232,7 @@ def get_ticket_queue(
     status_filter: Optional[TicketStatus] = Query(None),
     category_filter: Optional[TicketCategory] = Query(None),
     urgency_filter: Optional[Urgency] = Query(None),
-    sort_by: str = Query("created_at", regex="^(created_at|urgency|category)$"),
+    sort_by: str = Query("created_at", pattern="^(created_at|urgency|category)$"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):

@@ -43,7 +43,9 @@ class WandbLogger:
             job_type="evaluation",
             config=config or {},
             tags=default_tags,
-            reinit=True
+            # wandb>=0.18: boolean reinit is deprecated; "finish_previous"
+            # preserves the old True behavior.
+            reinit="finish_previous",
         )
         
         print(f"✓ W&B run started: {self.run.url}")
