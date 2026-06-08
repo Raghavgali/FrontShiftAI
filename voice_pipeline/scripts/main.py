@@ -61,12 +61,40 @@ from voice_pipeline.utils.logger import setup_logging
 # import even if prometheus_client isn't installed — the observability
 # module itself doesn't fail at import time, only start_metrics_server() does.
 try:
-    from voice_pipeline.observability.metrics import start_metrics_server
+    from voice_pipeline.observability.metrics import (
+        start_metrics_server,
+        voice_session_active,
+        voice_tool_calls_total,
+        voice_session_errors_total,
+    )
     start_metrics_server()
+    _PROM_OK = True
 except Exception:  # noqa: BLE001
     # Metrics are strictly additive; a missing dependency should never
     # prevent the voice worker from starting.
-    pass
+    _PROM_OK = False
+    voice_session_active = None  # type: ignore[assignment]
+    voice_tool_calls_total = None  # type: ignore[assignment]
+    voice_session_errors_total = None  # type: ignore[assignment]
+
+
+def _voice_tool_inc(tool: str, outcome: str) -> None:
+    """Increment voice_tool_calls_total — silently no-ops if Prometheus isn't loaded."""
+    if not _PROM_OK or voice_tool_calls_total is None:
+        return
+    try:
+        voice_tool_calls_total.labels(tool, outcome).inc()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _voice_error_inc(source: str) -> None:
+    if not _PROM_OK or voice_session_errors_total is None:
+        return
+    try:
+        voice_session_errors_total.labels(source).inc()
+    except Exception:  # noqa: BLE001
+        pass
 
 load_dotenv(dotenv_path=Path(__file__).parent / '.env')
 CONFIG = load_voice_config()
@@ -533,23 +561,29 @@ class VoiceAgent(Agent):
             )
             if resp.get("error"):
                 logger.error(f"❌ Website search failed: {resp.get('detail')}")
+                _voice_tool_inc("website_search", "error")
             else:
                 logger.info("✅ Website search successful")
+                _voice_tool_inc("website_search", "success")
             return resp
 
         @function_tool
         async def request_pto(message: str) -> dict:
             """Request PTO, check balance, or modify PTO requests."""
-            return await self.backend.post_with_retry(
+            resp = await self.backend.post_with_retry(
                 "/api/pto/chat", {"message": message}, timeout=60, max_retries=2
             )
+            _voice_tool_inc("request_pto", "error" if resp.get("error") else "success")
+            return resp
 
         @function_tool
         async def create_hr_ticket(message: str) -> dict:
             """Escalate to HR for meetings, payroll, etc."""
-            return await self.backend.post_with_retry(
+            resp = await self.backend.post_with_retry(
                 "/api/hr-tickets/chat", {"message": message}, timeout=60, max_retries=2
             )
+            _voice_tool_inc("create_hr_ticket", "error" if resp.get("error") else "success")
+            return resp
 
         agent_tools = [
             query_info,
@@ -776,8 +810,19 @@ async def entrypoint(ctx: JobContext):
         source = getattr(ev, "source", None)
         recoverable = getattr(err, "recoverable", False)
         source_name = source.__class__.__name__ if source else "unknown"
-        
+
         logger.error(f"Voice session error from {source_name}: {err}")
+
+        # Phase 7B: classify error source for the voice_session_errors_total counter
+        # so the resilience dashboard can attribute spikes to STT/TTS/LLM/LiveKit.
+        if source and _safe_isinstance(source, tts.TTS):
+            _voice_error_inc("tts")
+        elif source and _safe_isinstance(source, llm.LLM):
+            _voice_error_inc("llm")
+        elif _is_stt_source(source):
+            _voice_error_inc("stt")
+        else:
+            _voice_error_inc("livekit")
 
         if recoverable:
             return
@@ -802,7 +847,14 @@ async def entrypoint(ctx: JobContext):
     @session.on("close")
     def on_close(ev: CloseEvent) -> None:
         logger.info(f"Voice session closing: {ev.reason}")
-        
+
+        # Phase 7B: decrement the active-session gauge as the session winds down.
+        if _PROM_OK and voice_session_active is not None:
+            try:
+                voice_session_active.dec()
+            except Exception:  # noqa: BLE001
+                pass
+
         async def _cleanup():
             if background_audio:
                 try:
@@ -814,13 +866,26 @@ async def entrypoint(ctx: JobContext):
                     wandb_logger.finish()
                 except Exception:
                     pass
-        
+
         asyncio.create_task(_cleanup())
 
     try:
+        # Phase 7B: count the session as active before start() so a hung
+        # start() still shows up on the dashboard rather than vanishing.
+        if _PROM_OK and voice_session_active is not None:
+            try:
+                voice_session_active.inc()
+            except Exception:  # noqa: BLE001
+                pass
         await session.start(agent=agent, room=ctx.room)
     except Exception:
         logger.exception("Failed to start VoiceAgent session")
+        if _PROM_OK and voice_session_active is not None:
+            try:
+                voice_session_active.dec()
+            except Exception:  # noqa: BLE001
+                pass
+        _voice_error_inc("livekit")
         return
 
     # Generate greeting
