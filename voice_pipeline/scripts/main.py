@@ -138,14 +138,22 @@ class BackendClient:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.headers = {"Authorization": f"Bearer {token}"}
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            headers=self.headers,
+            timeout=30.0,
+            limits=httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5,
+            ),
+        )
         logger.info(f"🔗 BackendClient initialized: {self.base_url}")
         logger.info(f"🔑 Token preview: {token[:20]}...{token[-10:]}" if len(token) > 30 else f"🔑 Token: {token}")
 
     def update_token(self, new_token: str) -> None:
-        """Update the authentication token (e.g., when user token is extracted)."""
         self.token = new_token
         self.headers = {"Authorization": f"Bearer {new_token}"}
-        logger.info(f"🔑 Backend client token UPDATED: {new_token[:20]}...{new_token[-10:]}" if len(new_token) > 30 else f"🔑 Token updated")
+        self._client.headers["Authorization"] = f"Bearer {new_token}"
 
     async def post(
         self,
@@ -156,13 +164,119 @@ class BackendClient:
     ) -> dict:
         """Make POST request with configurable timeout."""
         logger.info(f"📤 POST {self.base_url}{path}")
-        headers = self.headers
-        if extra_headers:
-            headers = {**self.headers, **extra_headers}
-        async with httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=timeout) as client:
-            resp = await client.post(path, json=payload)
-            resp.raise_for_status()
-            return resp.json()
+        resp = await self._client.post(
+            path,
+            json=payload,
+            headers=extra_headers,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    
+    async def stream_post(
+        self,
+        path: str,
+        payload: dict,
+        timeout: float = 10,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ):
+        """POST and yield parsed SSE events."""
+        logger.info(f"STREAM POST {self.base_url}{path}")
+
+        async with self._client.stream(
+            "POST",
+            path,
+            json=payload,
+            headers=extra_headers,
+            timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+
+            event_name = "message"
+            data_lines = []
+
+            async for line in response.aiter_lines():
+                if line.startswith(":"):
+                    # SSE heartbeat/comment
+                    continue
+            
+                if line.startswith("event:"):
+                    event_name = line.removeprefix("event:").strip()
+                    continue
+
+                if line.startswith("data:"):
+                    data_lines.append(line.removeprefix("data:").strip())
+                    continue
+
+                if line == "" and data_lines:
+                    raw_data = "\n".join(data_lines)
+
+                    try:
+                        data = json.loads(raw_data)
+                    except json.JSONDecodeError:
+                        data = raw_data
+
+                    yield {
+                        "event": event_name,
+                        "data": data,
+                    }
+
+                    event_name = "message"
+                    data_lines = []
+
+    async def collect_stream(
+        self,
+        path: str,
+        payload: dict,
+        total_timeout: float = 10.0,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> dict:
+        """Consume an SSE stream within a wall-clock budget (Phase 2C).
+
+        Never raises. Returns {"events": [...], "error": str|None,
+        "timed_out": bool} so callers can salvage partial output. Stops at
+        the first done/error event.
+        """
+        events: list = []
+        error: Optional[str] = None
+        timed_out = False
+        agen = self.stream_post(
+            path, payload, timeout=total_timeout, extra_headers=extra_headers
+        )
+        deadline = time.time() + total_timeout
+        try:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    event = await _asyncio.wait_for(agen.__anext__(), timeout=remaining)
+                except StopAsyncIteration:
+                    break
+                events.append(event)
+                if event.get("event") in ("done", "error"):
+                    break
+        except _asyncio.TimeoutError:
+            timed_out = True
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            try:
+                await agen.aclose()
+            except Exception:
+                pass
+
+        if error is None:
+            for event in events:
+                if event.get("event") == "error":
+                    data = event.get("data")
+                    error = (
+                        data.get("detail", "stream error")
+                        if isinstance(data, dict)
+                        else str(data)
+                    )
+        return {"events": events, "error": error, "timed_out": timed_out}
 
     async def post_with_retry(
         self,
@@ -217,13 +331,14 @@ class BackendClient:
     async def health_check(self) -> bool:
         """Check if backend is reachable."""
         try:
-            async with httpx.AsyncClient(base_url=self.base_url, timeout=10) as client:
-                resp = await client.get("/health")
-                return resp.status_code == 200
+            resp = await self._client.get("/health", timeout=10)
+            return resp.status_code == 200
         except Exception as e:
             logger.warning(f"Backend health check failed: {e}")
             return False
 
+    async def close(self) -> None:
+        await self._client.aclose()
 
 def _safe_isinstance(obj: Any, candidate) -> bool:
     """Guard isinstance to tolerate monkeypatched placeholders."""
@@ -484,13 +599,78 @@ class VoiceAgent(Agent):
                 top_k=top_k
             )
 
-            payload = {"query": query, "top_k": top_k}
-            # Use longer timeout for RAG queries (they can be slow).
-            # post_with_retry returns a graceful {"error": True, ...} dict on final failure
-            # instead of raising, so we never crash the voice turn.
-            data = await self.backend.post_with_retry(
-                "/api/rag/query", payload, timeout=120, max_retries=2
+            payload = {
+                "query": query,
+                "top_k": top_k,
+                # Voice needs short spoken answers fast: cap generation length
+                # and use Groq (Phase 1D/1E). Chat keeps the Mercury default.
+                "max_tokens": 256,
+                "generation_backend": "groq",
+            }
+            # Phase 2B/2C: consume the SSE endpoint with a 10s wall-clock
+            # budget. collect_stream never raises, so the voice turn cannot
+            # crash on stream failures.
+            outcome = await self.backend.collect_stream(
+                "/api/rag/query/stream", payload, total_timeout=10.0
             )
+
+            answer_parts = []
+            sources = []
+            timings = {}
+
+            for event in outcome["events"]:
+                event_type = event["event"]
+                event_data = event["data"] if isinstance(event["data"], dict) else {}
+
+                if event_type == "sources":
+                    sources = event_data.get("sources", [])
+                elif event_type == "token":
+                    answer_parts.append(event_data.get("token", ""))
+                elif event_type == "done":
+                    timings = event_data
+
+            interrupted = (
+                bool(outcome["error"]) or outcome["timed_out"] or not timings
+            )
+
+            if interrupted and not answer_parts:
+                # Nothing salvageable from the stream: fall back to the batch
+                # endpoint, which returns a graceful {"error": True, ...} dict
+                # on final failure instead of raising.
+                logger.warning(
+                    "RAG stream yielded nothing "
+                    f"(error={outcome['error']}, timed_out={outcome['timed_out']}); "
+                    "falling back to batch endpoint"
+                )
+                data = await self.backend.post_with_retry(
+                    "/api/rag/query", payload, timeout=8, max_retries=1
+                )
+            else:
+                answer = "".join(answer_parts).strip()
+                if interrupted:
+                    # Phase 2C: partial answer, never cached server-side.
+                    logger.warning(
+                        f"RAG stream interrupted after {len(answer_parts)} tokens "
+                        f"(error={outcome['error']}, timed_out={outcome['timed_out']})"
+                    )
+                    answer += (
+                        " ... sorry, I lost my train of thought there. "
+                        "Ask me again if you need the rest."
+                    )
+                data = {
+                    "answer": answer,
+                    "sources": sources,
+                    "company": timings.get("company", self.company),
+                    "duration_seconds": timings.get("duration_seconds", 0.0),
+                    "retrieval_duration_seconds": timings.get(
+                        "retrieval_duration_seconds", 0.0
+                    ),
+                    "generation_duration_seconds": timings.get(
+                        "generation_duration_seconds", 0.0
+                    ),
+                    "cache_hit": False,
+                }
+
             duration = time.time() - start_time
 
             if data.get("error"):
@@ -557,7 +737,7 @@ class VoiceAgent(Agent):
             logger.info(f"🔧 website_search tool called with query: {query}")
             payload = {"message": f"search the company website for: {query}"}
             resp = await self.backend.post_with_retry(
-                "/api/chat/message", payload, timeout=60, max_retries=2
+                "/api/chat/message", payload, timeout=10, max_retries=1
             )
             if resp.get("error"):
                 logger.error(f"❌ Website search failed: {resp.get('detail')}")
@@ -570,17 +750,15 @@ class VoiceAgent(Agent):
         @function_tool
         async def request_pto(message: str) -> dict:
             """Request PTO, check balance, or modify PTO requests."""
-            resp = await self.backend.post_with_retry(
-                "/api/pto/chat", {"message": message}, timeout=60, max_retries=2
-            )
+            resp = await self._agent_chat_stream("/api/pto/chat", message, "request_pto")
             _voice_tool_inc("request_pto", "error" if resp.get("error") else "success")
             return resp
 
         @function_tool
         async def create_hr_ticket(message: str) -> dict:
             """Escalate to HR for meetings, payroll, etc."""
-            resp = await self.backend.post_with_retry(
-                "/api/hr-tickets/chat", {"message": message}, timeout=60, max_retries=2
+            resp = await self._agent_chat_stream(
+                "/api/hr-tickets/chat", message, "create_hr_ticket"
             )
             _voice_tool_inc("create_hr_ticket", "error" if resp.get("error") else "success")
             return resp
@@ -684,6 +862,41 @@ class VoiceAgent(Agent):
     def update_backend_token(self, token: str) -> None:
         """Update the backend authentication token at runtime."""
         self.backend.update_token(token)
+
+    async def _agent_chat_stream(self, path: str, message: str, tool: str) -> dict:
+        """Phase 2D: call an agent chat endpoint via SSE, with batch fallback.
+
+        Streams {path}/stream and returns the done event's body (same shape
+        as the batch response). One idempotency key spans the stream attempt
+        and the batch fallback, so a stream that already committed the
+        mutation dedupes the retry server-side instead of double-applying it.
+        """
+        idempotency_key = str(uuid.uuid4())
+        outcome = await self.backend.collect_stream(
+            f"{path}/stream",
+            {"message": message},
+            total_timeout=15.0,
+            extra_headers={"Idempotency-Key": idempotency_key},
+        )
+        for event in outcome["events"]:
+            data = event["data"] if isinstance(event["data"], dict) else {}
+            if event["event"] == "status":
+                logger.info(f"🧭 {tool} stage: {data.get('stage')}")
+            elif event["event"] == "done":
+                return data
+
+        logger.warning(
+            f"{tool} stream did not complete "
+            f"(error={outcome['error']}, timed_out={outcome['timed_out']}); "
+            "falling back to batch POST with the same idempotency key"
+        )
+        return await self.backend.post_with_retry(
+            path,
+            {"message": message},
+            timeout=10,
+            max_retries=1,
+            idempotency_key=idempotency_key,
+        )
 
     def attach_metric_sources(self, stt_chain, llm_chain, tts_chain, vad_monitor) -> None:
         """Register metric handlers against actual media components."""
@@ -856,6 +1069,11 @@ async def entrypoint(ctx: JobContext):
                 pass
 
         async def _cleanup():
+            try:
+                await agent.backend.close()
+            except Exception:
+                logger.exception("Failed to close backend HTTP client")
+
             if background_audio:
                 try:
                     await background_audio.aclose()
