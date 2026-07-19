@@ -29,9 +29,13 @@ Unlike standard chatbots, FrontShiftAI operates as a **Multi-Tenant System of Ag
 
 | Component | Provider | URL |
 |-----------|----------|-----|
-| **Frontend App** | **Vercel** ( Recommended) | [https://frontshiftai.vercel.app/](https://frontshiftai.vercel.app/) |
-| **Frontend App** | Cloud Run | [https://frontshiftai-frontend-vvukpmzsxa-uc.a.run.app](https://frontshiftai-frontend-vvukpmzsxa-uc.a.run.app) |
-| **Backend API** | Cloud Run | [https://frontshiftai-backend-vvukpmzsxa-uc.a.run.app/docs](https://frontshiftai-backend-vvukpmzsxa-uc.a.run.app/docs) |
+| **Landing Page** | **GitHub Pages** (live) | [https://raghavgali.github.io/FrontShiftAI/](https://raghavgali.github.io/FrontShiftAI/) |
+| **Backend API** | Cloud Run | Redeployment under this fork's own GCP project is in progress |
+| **Voice Agent** | Modal | Deployed from `voice_pipeline/modal_deploy.py` (scale-to-zero) |
+
+The original capstone deployments (Vercel + the group's GCP project) belonged
+to the team infrastructure and are being migrated to accounts owned by this
+fork; links here are updated as each piece comes online.
 
 ---
 
