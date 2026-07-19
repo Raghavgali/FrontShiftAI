@@ -1,16 +1,25 @@
 """Idempotency-Key support for mutation endpoints.
 
-Usage pattern inside a handler::
+Usage pattern inside a handler (reserve-then-execute, concurrency-safe)::
 
     @router.post("/api/pto/chat")
     async def chat(request, current_user, db, idem = Depends(idempotency_guard)):
-        cached = idem.lookup(db, current_user["company"], endpoint="/api/pto/chat")
+        cached = idem.reserve(db, current_user["company"], endpoint="/api/pto/chat")
         if cached is not None:
-            return cached
-        result = do_work(...)
-        idem.store(db, current_user["company"], endpoint="/api/pto/chat",
-                   status_code=200, body=result.model_dump())
-        return result
+            return cached          # key already completed: replay the body
+        try:
+            result = do_work(...)  # this caller holds the reservation
+            idem.store(db, current_user["company"], endpoint="/api/pto/chat",
+                       status_code=200, body=result.model_dump())
+            return result
+        except Exception:
+            idem.release(db, current_user["company"])  # let the client retry
+            raise
+
+reserve() INSERTs a PENDING placeholder under the (key, company) primary
+key, so of N concurrent requests with the same key exactly one performs the
+side effect; the rest get the cached body or a 409 + Retry-After while the
+winner is still working.
 
 When the caller (e.g. the voice agent) passes an ``Idempotency-Key`` header,
 the first request is processed normally and its response body persisted. Any
@@ -25,12 +34,17 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from db.models import IdempotencyRecord
 
 logger = logging.getLogger(__name__)
+
+# Sentinel status for a reservation whose work is still in flight. Uses HTTP
+# 102 (Processing) so it can never collide with a real cached status code.
+PENDING_STATUS = 102
 
 
 class IdempotencyGuard:
@@ -70,11 +84,92 @@ class IdempotencyGuard:
             return None
         if record is None:
             return None
+        if record.status_code == PENDING_STATUS:
+            # A concurrent holder is still working; treat as a miss here.
+            # Callers wanting exactly-once semantics should use reserve().
+            return None
         try:
             return json.loads(record.response_body)
         except (TypeError, ValueError):
             logger.error("idempotency record %s has non-JSON body; ignoring", self.key)
             return None
+
+    def reserve(self, db: Session, company: str, endpoint: str) -> Optional[Dict[str, Any]]:
+        """Atomically claim this key BEFORE performing the mutation.
+
+        Concurrency-safe exactly-once guard: the (key, company) primary key
+        makes the INSERT a mutual-exclusion point, so of N concurrent
+        requests with the same key exactly one wins the reservation and
+        performs the side effect. Losers either get the cached body (work
+        already finished) or a 409 telling them to retry shortly (work still
+        in flight).
+
+        Returns None when the caller holds the reservation and must proceed,
+        then either store() (success) or release() (failure). Returns the
+        cached response body when the key already completed. Raises 409 when
+        another request holds the reservation right now.
+        """
+        if not self.enabled or not company:
+            return None
+
+        reservation = IdempotencyRecord(
+            key=self.key,
+            company=company,
+            endpoint=endpoint,
+            status_code=PENDING_STATUS,
+            response_body="",
+        )
+        try:
+            db.add(reservation)
+            db.commit()
+            return None  # reservation acquired — caller proceeds
+        except IntegrityError:
+            db.rollback()
+        except Exception as exc:  # pragma: no cover - defensive
+            db.rollback()
+            logger.warning("idempotency reserve failed open for %s: %s", self.key, exc)
+            return None
+
+        existing = (
+            db.query(IdempotencyRecord)
+            .filter(
+                IdempotencyRecord.key == self.key,
+                IdempotencyRecord.company == company,
+            )
+            .first()
+        )
+        if existing is None:  # pragma: no cover - race with cleanup cron
+            return None
+        if existing.status_code == PENDING_STATUS:
+            raise HTTPException(
+                status_code=409,
+                detail="A request with this Idempotency-Key is already being processed",
+                headers={"Retry-After": "2"},
+            )
+        try:
+            return json.loads(existing.response_body)
+        except (TypeError, ValueError):
+            logger.error("idempotency record %s has non-JSON body; ignoring", self.key)
+            return None
+
+    def release(self, db: Session, company: str) -> None:
+        """Drop an unfinished reservation so the client can retry cleanly.
+
+        Call on the failure path after a successful reserve(). Only removes
+        the PENDING placeholder; completed records are never deleted here.
+        """
+        if not self.enabled or not company:
+            return
+        try:
+            db.query(IdempotencyRecord).filter(
+                IdempotencyRecord.key == self.key,
+                IdempotencyRecord.company == company,
+                IdempotencyRecord.status_code == PENDING_STATUS,
+            ).delete(synchronize_session=False)
+            db.commit()
+        except Exception as exc:  # pragma: no cover - defensive
+            db.rollback()
+            logger.warning("idempotency release failed for %s: %s", self.key, exc)
 
     def store(
         self,
@@ -86,10 +181,10 @@ class IdempotencyGuard:
     ) -> None:
         """Persist the response for this key.
 
-        Safe to call even when idempotency is not enabled — it just returns.
-        Swallows integrity errors (two concurrent identical requests racing to
-        INSERT the same key); the earlier write wins and the later one is a
-        harmless duplicate-ignore.
+        Completes a reserve() by promoting the PENDING placeholder to the
+        real response body. Falls back to a plain INSERT for callers that
+        never reserved (legacy lookup/store pattern). Safe to call even when
+        idempotency is not enabled — it just returns.
         """
         if not self.enabled or not company:
             return
@@ -99,15 +194,28 @@ class IdempotencyGuard:
             logger.error("idempotency store: body not JSON-serializable: %s", exc)
             return
 
-        record = IdempotencyRecord(
-            key=self.key,
-            company=company,
-            endpoint=endpoint,
-            status_code=status_code,
-            response_body=serialized,
-        )
         try:
-            db.add(record)
+            updated = (
+                db.query(IdempotencyRecord)
+                .filter(
+                    IdempotencyRecord.key == self.key,
+                    IdempotencyRecord.company == company,
+                )
+                .update(
+                    {"status_code": status_code, "response_body": serialized},
+                    synchronize_session=False,
+                )
+            )
+            if not updated:
+                db.add(
+                    IdempotencyRecord(
+                        key=self.key,
+                        company=company,
+                        endpoint=endpoint,
+                        status_code=status_code,
+                        response_body=serialized,
+                    )
+                )
             db.commit()
         except Exception as exc:
             db.rollback()

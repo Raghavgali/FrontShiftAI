@@ -43,9 +43,10 @@ async def chat_with_agent(
     Chat with PTO agent
     User can request PTO, check balance, view requests, or ask questions
     """
-    # Idempotency: replayed voice tool calls (same key) return the cached response
-    # without creating a duplicate PTORequest.
-    cached = idem.lookup(db, current_user["company"], endpoint="/api/pto/chat")
+    # Idempotency: reserve the key before the mutation so concurrent replays
+    # (same key) cannot both create a PTORequest. Completed keys return the
+    # cached response; an in-flight duplicate gets 409 + Retry-After.
+    cached = idem.reserve(db, current_user["company"], endpoint="/api/pto/chat")
     if cached is not None:
         return cached
 
@@ -99,7 +100,7 @@ async def chat_with_agent(
 
     except Exception as e:
         logger.error(f"Error in PTO agent chat: {e}")
-        
+
         # Log failure
         execution_time_ms = (time.time() - start_time) * 1000
         production_monitor.log_agent_execution(
@@ -108,7 +109,9 @@ async def chat_with_agent(
             success=False,
             company_id=current_user["company"]
         )
-        
+
+        # Drop the reservation so a retry with the same key gets a real attempt.
+        idem.release(db, current_user["company"])
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process your request. Please try again."
@@ -135,8 +138,9 @@ async def chat_with_agent_stream(
 
     # Same endpoint key as the batch route: a stream that completed the
     # mutation dedupes a subsequent batch retry with the same key (and
-    # vice versa).
-    cached = idem.lookup(db, company, endpoint="/api/pto/chat")
+    # vice versa). reserve() makes this concurrency-safe: an in-flight
+    # duplicate is rejected with 409 before any work happens.
+    cached = idem.reserve(db, company, endpoint="/api/pto/chat")
 
     async def event_stream():
         # The tenant ContextVar set by middleware is cleared before this
@@ -167,6 +171,7 @@ async def chat_with_agent_stream(
                     success=False,
                     company_id=company,
                 )
+                idem.release(db, company)
                 yield {
                     "event": "error",
                     "data": json.dumps({
@@ -203,6 +208,7 @@ async def chat_with_agent_stream(
 
         except Exception as e:
             logger.error(f"Error in PTO agent stream: {e}", exc_info=True)
+            idem.release(db, company)
             yield {
                 "event": "error",
                 "data": json.dumps({

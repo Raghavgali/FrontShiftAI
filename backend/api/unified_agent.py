@@ -177,10 +177,11 @@ async def unified_chat(
     conversation_id = request.conversation_id
     company = current_user["company"]
 
-    # Idempotency: if the client replays with the same key, return the cached
-    # response and skip writing duplicate Conversation/Message rows or
-    # duplicate PTO/HR tickets downstream.
-    cached = idem.lookup(db, company, endpoint="/api/chat/message")
+    # Idempotency: reserve the key BEFORE doing any work so two concurrent
+    # replays cannot both write Conversation/Message rows or create duplicate
+    # PTO/HR tickets downstream. Completed keys replay the cached response;
+    # an in-flight duplicate gets 409 + Retry-After.
+    cached = idem.reserve(db, company, endpoint="/api/chat/message")
     if cached is not None:
         return cached
 
@@ -503,7 +504,9 @@ async def unified_chat(
         db.commit()
         
         # Don't cache error responses — a retry with the same key should get
-        # a real attempt, not the cached apology.
+        # a real attempt, not the cached apology. Release the reservation so
+        # that retry isn't blocked by the PENDING placeholder.
+        idem.release(db, company)
         return ChatResponse(
             response="I apologize, but I encountered an internal error while processing your request. Our team has been notified.",
             agent_used="error",

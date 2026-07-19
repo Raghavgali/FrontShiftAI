@@ -59,7 +59,7 @@ async def create_ticket_via_chat(
     """
     # Idempotency: replayed voice tool calls (same key) return the cached response
     # without creating a duplicate HRTicket.
-    cached = idem.lookup(db, current_user["company"], endpoint="/api/hr-tickets/chat")
+    cached = idem.reserve(db, current_user["company"], endpoint="/api/hr-tickets/chat")
     if cached is not None:
         return cached
 
@@ -127,6 +127,8 @@ async def create_ticket_via_chat(
             success=False,
             company_id=current_user["company"]
         )
+        # Drop the reservation so a retry with the same key gets a real attempt.
+        idem.release(db, current_user["company"])
         raise
 
 
@@ -148,7 +150,9 @@ async def create_ticket_via_chat_stream(
     is_admin = current_user.get("role") == "super_admin"
 
     # Same endpoint key as the batch route so retries dedupe across both.
-    cached = idem.lookup(db, company, endpoint="/api/hr-tickets/chat")
+    # reserve() makes this concurrency-safe: an in-flight duplicate is
+    # rejected with 409 before any work happens.
+    cached = idem.reserve(db, company, endpoint="/api/hr-tickets/chat")
 
     async def event_stream():
         # The tenant ContextVar set by middleware is cleared before this
@@ -179,6 +183,7 @@ async def create_ticket_via_chat_stream(
                     success=False,
                     company_id=company,
                 )
+                idem.release(db, company)
                 yield {
                     "event": "error",
                     "data": json.dumps({
@@ -226,6 +231,7 @@ async def create_ticket_via_chat_stream(
 
         except Exception as e:
             logger.error(f"Error in HR ticket stream: {e}", exc_info=True)
+            idem.release(db, company)
             yield {
                 "event": "error",
                 "data": json.dumps({
