@@ -93,27 +93,8 @@ class HRTicketAgent:
             dict with response and ticket info
         """
         # Initialize state
-        initial_state: HRTicketState = {
-            "user_email": user_email,
-            "company": company,
-            "user_message": message,
-            "intent": "",
-            "subject": None,
-            "description": None,
-            "category": None,
-            "meeting_type": None,
-            "preferred_date": None,
-            "preferred_time_slot": None,
-            "urgency": "normal",
-            "is_valid": False,
-            "validation_errors": [],
-            "has_open_tickets": False,
-            "open_ticket_ids": [],
-            "ticket_id": None,
-            "queue_position": None,
-            "agent_response": ""
-        }
-        
+        initial_state = self._initial_state(user_email, company, message)
+
         # Run the workflow
         # Pass db to each node via config
         config = {"configurable": {"db": db}}
@@ -150,6 +131,35 @@ class HRTicketAgent:
             final_state["is_valid"] = False
         
         # Return result
+        return self._result_from_state(final_state)
+
+    @staticmethod
+    def _initial_state(user_email: str, company: str, message: str) -> HRTicketState:
+        """Build the initial workflow state."""
+        return {
+            "user_email": user_email,
+            "company": company,
+            "user_message": message,
+            "intent": "",
+            "subject": None,
+            "description": None,
+            "category": None,
+            "meeting_type": None,
+            "preferred_date": None,
+            "preferred_time_slot": None,
+            "urgency": "normal",
+            "is_valid": False,
+            "validation_errors": [],
+            "has_open_tickets": False,
+            "open_ticket_ids": [],
+            "ticket_id": None,
+            "queue_position": None,
+            "agent_response": ""
+        }
+
+    @staticmethod
+    def _result_from_state(final_state: dict) -> dict:
+        """Shape the API result dict from a final workflow state."""
         return {
             "response": final_state["agent_response"],
             "ticket_created": final_state.get("ticket_id") is not None,
@@ -158,6 +168,47 @@ class HRTicketAgent:
             "has_open_tickets": final_state.get("has_open_tickets", False),
             "open_ticket_ids": final_state.get("open_ticket_ids", [])
         }
+
+    async def process_message_stream(
+        self,
+        user_email: str,
+        company: str,
+        message: str,
+        db: Session
+    ):
+        """
+        Process a user message, streaming per-node progress.
+
+        Mirrors process_message's manual node sequence (the compiled graph is
+        not used because the nodes need the db session). Yields ("status",
+        payload) before each node runs, then ("done", result) with the same
+        shape as process_message().
+        """
+        state = self._initial_state(user_email, company, message)
+
+        try:
+            yield "status", {"stage": "parse_intent"}
+            state = parse_intent_node(state, db)
+
+            yield "status", {"stage": "validate_request"}
+            state = validate_request_node(state, db)
+
+            if state["is_valid"]:
+                yield "status", {"stage": "check_duplicates"}
+                state = check_duplicates_node(state, db)
+
+                yield "status", {"stage": "create_ticket"}
+                state = create_ticket_node(state, db)
+
+            yield "status", {"stage": "generate_response"}
+            state = generate_response_node(state, db)
+
+        except Exception as e:
+            print(f"Error in workflow: {e}")
+            state["agent_response"] = "I'm sorry, there was an error processing your request. Please try again."
+            state["is_valid"] = False
+
+        yield "done", self._result_from_state(state)
 
 
 # Singleton instance

@@ -5,9 +5,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from datetime import datetime
+import json
+import logging
 import time  # ADD THIS
 
+from sse_starlette import EventSourceResponse
+
 from db.connection import get_db
+from db.tenant_context import set_tenant_context, clear_tenant_context
 from db.models import HRTicket, TicketStatus, TicketCategory, Urgency, User, UserRole
 from schemas.hr_ticket import (
     HRTicketChatRequest,
@@ -31,6 +36,8 @@ from agents.hr_ticket.tools import (
 from api.auth import get_current_user
 from api.idempotency import IdempotencyGuard, idempotency_guard
 from monitoring.production_logger import production_monitor  # ADD THIS
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/hr-tickets", tags=["HR Tickets"])
 
@@ -121,6 +128,123 @@ async def create_ticket_via_chat(
             company_id=current_user["company"]
         )
         raise
+
+
+@router.post("/chat/stream")
+async def create_ticket_via_chat_stream(
+    request: HRTicketChatRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    idem: IdempotencyGuard = Depends(idempotency_guard),
+):
+    """
+    Chat with the HR ticket agent, streaming per-node progress as SSE.
+
+    Events: `status` per workflow node, then `done` with the same body as
+    POST /api/hr-tickets/chat. Errors emit an `error` event.
+    """
+    user_email = current_user["email"]
+    company = current_user["company"]
+    is_admin = current_user.get("role") == "super_admin"
+
+    # Same endpoint key as the batch route so retries dedupe across both.
+    cached = idem.lookup(db, company, endpoint="/api/hr-tickets/chat")
+
+    async def event_stream():
+        # The tenant ContextVar set by middleware is cleared before this
+        # generator body runs (it executes after call_next returns), so
+        # re-establish it for all DB access below (Phase 0.6 auto-filter).
+        set_tenant_context(company=company, is_super_admin=is_admin)
+        start_time = time.time()
+        try:
+            if cached is not None:
+                yield {"event": "done", "data": json.dumps(cached)}
+                return
+
+            agent = get_hr_ticket_agent()
+            result = None
+            async for kind, payload in agent.process_message_stream(
+                user_email=user_email, company=company, message=request.message, db=db
+            ):
+                if kind == "status":
+                    yield {"event": "status", "data": json.dumps(payload)}
+                else:
+                    result = payload
+
+            execution_time_ms = (time.time() - start_time) * 1000
+            if result is None:
+                production_monitor.log_agent_execution(
+                    agent_name="hr_ticket",
+                    execution_time_ms=execution_time_ms,
+                    success=False,
+                    company_id=company,
+                )
+                yield {
+                    "event": "error",
+                    "data": json.dumps({
+                        "detail": "agent produced no result",
+                        "response": "Failed to process your request. Please try again.",
+                    }),
+                }
+                return
+
+            production_monitor.log_agent_execution(
+                agent_name="hr_ticket",
+                execution_time_ms=execution_time_ms,
+                success=True,
+                company_id=company,
+            )
+            if result["ticket_created"]:
+                production_monitor.run.log({
+                    "business/hr_ticket_created": 1,
+                    "business/company": company,
+                    "timestamp": time.time()
+                })
+
+            ticket_details = None
+            if result["ticket_created"] and result["ticket_id"]:
+                ticket = get_ticket_by_id(db, result["ticket_id"], company)
+                if ticket:
+                    ticket_details = HRTicketResponse.model_validate(ticket)
+
+            response = HRTicketChatResponse(
+                response=result["response"],
+                ticket_created=result["ticket_created"],
+                ticket_id=result.get("ticket_id"),
+                queue_position=result.get("queue_position"),
+                ticket_details=ticket_details,
+            )
+            body = response.model_dump(mode="json")
+            idem.store(
+                db,
+                company,
+                endpoint="/api/hr-tickets/chat",
+                status_code=200,
+                body=body,
+            )
+            yield {"event": "done", "data": json.dumps(body)}
+
+        except Exception as e:
+            logger.error(f"Error in HR ticket stream: {e}", exc_info=True)
+            yield {
+                "event": "error",
+                "data": json.dumps({
+                    "detail": str(e),
+                    "response": "Failed to process your request. Please try again.",
+                }),
+            }
+        finally:
+            clear_tenant_context()
+
+    return EventSourceResponse(
+        event_stream(),
+        ping=15,
+        send_timeout=10,
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/my-tickets", response_model=HRTicketListResponse)
