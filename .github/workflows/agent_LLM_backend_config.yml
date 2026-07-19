@@ -1,7 +1,5 @@
 name: Agent Pipeline - Agent Tests LLM Backend Configuration Check 
 on:
-  push:
-    branches: [ '**' ]
   pull_request:
     branches: [ '**' ]
   workflow_dispatch:

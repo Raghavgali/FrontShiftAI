@@ -2,10 +2,6 @@ name: Agent Pipeline -Agent Tests - website_extraction
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ "main" ]
-    paths:
-      - "backend/agents/website_extraction/**"
   # pull_request:
   #   branches: [ "main" ]
   #   paths:

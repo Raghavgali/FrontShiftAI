@@ -1,9 +1,7 @@
 name: Agent Pipeline - Agent Evaluation 
 
 on:
-  workflow_dispatch:  # Allow manual trigger
-  push:
-    branches: [ "main" ]
+  workflow_dispatch:  # Manual trigger only
   # pull_request:
   #   branches: [ '**' ]
 

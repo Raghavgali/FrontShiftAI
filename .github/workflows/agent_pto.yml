@@ -1,10 +1,6 @@
 name: Agent Pipeline - Agent Tests PTO - Agent
 on:
   workflow_dispatch:
-  push:
-    branches: [ "main" ]
-    paths:
-      - "backend/agents/pto/**"
   # pull_request:
   #   branches: [ "main" ]
   #   paths:
