@@ -24,6 +24,7 @@ This directory contains the CI/CD pipelines for the FrontShiftAI project. The wo
 
 ## 📊 Evaluation
 
+
 | Workflow | Description | Triggers |
 |----------|-------------|----------|
 | `core_eval.yml` | Runs the **Core Evaluation** experiment using `chat_pipeline` and deploys the model if successful. | Manual |

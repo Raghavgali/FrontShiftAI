@@ -6,7 +6,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.12+-blue) ![React](https://img.shields.io/badge/React-18.2-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.104-green) ![Docker](https://img.shields.io/badge/Docker-Enabled-blue) ![GCP](https://img.shields.io/badge/GCP-Cloud%20Run-orange)
 
-> This repository is a personal continuation of a project originally built as team coursework at Northeastern University. It is currently undergoing a production-readiness overhaul — see **[Production Readiness Roadmap](#production-readiness-roadmap)** below for the in-progress plan.
+> **Owned and maintained by [Raghav Gali](https://github.com/Raghavgali).** The original application was built as team coursework at Northeastern University; everything since is a solo effort. I designed and am implementing the full production-readiness overhaul: critical resilience fixes, idempotency keys, multi-tenant isolation hardening, JWT refresh-token rotation, a resilience policy matrix with circuit breakers, Prometheus + Grafana observability with SLOs, and the latency + SSE streaming rework across backend, voice pipeline, and frontend. See the **[Production Readiness Roadmap](#production-readiness-roadmap)** for the phase-by-phase record, [`plan.md`](./plan.md) for the engineering plan, and the commit history for the implementation trail.
 
 ---
 
@@ -53,7 +53,7 @@ The system isn't just a chatbot; it's a squad of specialized agents coordinated 
 
 ### 1.1 LLM Architecture & Resiliency
 
-To ensure 99.9% uptime and low latency, we employ a robust fallback strategy across different model providers:
+To ensure 99.9% uptime and low latency, the platform employs a robust fallback strategy across different model providers:
 
 | Component | Main LLM | Backup Chain (in order) |
 | :--- | :--- | :--- |
@@ -77,7 +77,7 @@ To ensure 99.9% uptime and low latency, we employ a robust fallback strategy acr
 
 ###  4. Enterprise-Grade Operations
 
-*   **Model Registry**: We version-control our AI "brains". We can rollout v2 and rollback to v1 instantly if issues arise.
+*   **Model Registry**: AI "brains" are version-controlled, so v2 can roll out and roll back to v1 instantly if issues arise.
 *   **Monitoring**: Real-time dashboards (Weights & Biases) track token usage, latency, and user feedback (thumbs up/down).
 *   **CI/CD**: Automated GitHub Actions for testing backend/frontend and retraining RAG models.
 
@@ -254,7 +254,7 @@ The system acts as a knowledge engine for organizational data.
 ## Monitoring & Testing
 
 ### Monitoring Strategy
-We utilize a dual-layer strategy to ensure reliability:
+The system uses a dual-layer strategy to ensure reliability:
 1.  **Infrastructure Level**: Google Cloud Monitoring tracks container latency, error rates (5xx), and CPU/Memory usage.
 2.  **Application Level**: **Weights & Biases (W&B)** traces every LLM interaction, logging:
     - Token consumption and Cost per request.
@@ -270,7 +270,7 @@ We utilize a dual-layer strategy to ensure reliability:
 
 ## Fairness & Bias Mitigation
 
-We actively monitor for **Representation Bias** to ensure equitable performance across all 19+ tenant organizations, regardless of their size or industry.
+The evaluation suite actively monitors for **Representation Bias** to ensure equitable performance across all 19+ tenant organizations, regardless of their size or industry.
 
 ### 1. Data Bias Analysis
 - **Metric**: Gini Coefficient of Handbook Volume.
@@ -348,7 +348,7 @@ This is a personal project; external contributions aren't expected, but if you f
 
 ## Production Readiness Roadmap
 
-The codebase was originally a team coursework submission; it is now being hardened along a structured plan (see [`plan.md`](./plan.md) and [`system_design.md`](./system_design.md)) before further feature work. Status as of this README:
+The original codebase was a team coursework submission. The production hardening below is an individual effort by [Raghav Gali](https://github.com/Raghavgali), who authored the structured plan (see [`plan.md`](./plan.md) and [`system_design.md`](./system_design.md)) and implemented every completed phase. Status as of this README:
 
 | Phase | Focus | Status |
 |-------|-------|--------|
@@ -357,13 +357,15 @@ The codebase was originally a team coursework submission; it is now being harden
 | **0.6 — Multi-Tenant Hardening** | Request-scoped `ContextVar` + SQLAlchemy `before_compile` listener auto-filters by `company`; `bypass_tenant_filter()` ctx manager with audit log; `TenantScopedRetriever` for ChromaDB; startup validator fails fast if any chunk lacks a `company` label; GH Actions blocks raw SQL outside allow-list | ✅ Complete |
 | **0.7 — JWT Refresh Tokens** | Access-token TTL 1y → 1h; `RefreshToken` stored as SHA-256 hash; rotation-on-use with chain-burn theft detection; `/refresh`, `/logout`, `/voice-token` endpoints; frontend Axios interceptor auto-refreshes on 401 and replays the original request | ✅ Complete |
 | **6.5 — Resilience Policy Matrix** | Single source of truth for timeout / retry / backoff / circuit-breaker per call type; `@resilient(policy=…)` decorator with per-key circuit breaker; Brave Search migrated as the reference implementation | ✅ Complete |
-| **7 — Prometheus + Grafana Observability** | Backend + voice-pipeline instrumentation (four golden signals), correlation IDs, SLO definitions, six provisioned dashboards, Locust → Prometheus export | ⏳ Up next |
-| **1–5 — Latency & Streaming** | HTTP pooling, VAD tuning, `max_tokens` + Groq voice path, SSE streaming extended to PTO/HR agents, caching, prefetch | ⏳ Deferred (after Phase 7 baseline) |
+| **7 — Prometheus + Grafana Observability** | Backend + voice-pipeline instrumentation (four golden signals), correlation IDs, SLO definitions, six provisioned dashboards, Locust → Prometheus export | ✅ Complete |
+| **1 — Quick Wins: Latency + Resilience** | Persistent pooled HTTP client in voice `BackendClient`, silero VAD tuned (0.3s silence / 0.1s speech), tool timeouts cut (RAG 8s, others 10s), per-request `max_tokens` + `generation_backend` through schema → pipeline → generator, voice uses Groq at 256 tokens | ✅ Complete |
+| **2 — Streaming (SSE)** | Token-level streaming from Groq/Mercury/OpenAI, `POST /api/rag/query/stream` (sources/token/done events), PTO + HR agent `/chat/stream` with per-node status events, voice agent consumes streams with 10s budget + partial-answer fallback + idempotency-keyed batch retry, frontend fetch-stream client | ✅ Complete |
+| **3–5 — Infra, Caching, Voice Fast Path** | Modal keep-warm, worker crash recovery, TTL caching, voice prefetch on partial STT | ⏳ Up next |
 | **5.5 — Durable LangGraph Checkpointing** | `PostgresSaver` checkpointer for multi-turn resume + admin-approval workflows | ⏳ Deferred |
 
 Tests for completed phases live in [`stress_tests/`](./stress_tests/); policy docs in [`docs/resilience_policy.md`](./docs/resilience_policy.md) and [`docs/resilience_audit.md`](./docs/resilience_audit.md).
 
 ---
 
-## License
-Originally developed as a coursework project at Northeastern University (MLOps Group 9); this repository is a personal continuation by Raghav Gali. License: **TBD** — treat as all-rights-reserved until a formal license file is added.
+## Ownership & License
+Originally developed as a coursework project at Northeastern University (MLOps Group 9). This repository is owned and maintained by [Raghav Gali](https://github.com/Raghavgali), who is solely responsible for the production-readiness roadmap and all post-coursework engineering. License: **TBD**. Treat as all-rights-reserved until a formal license file is added.
