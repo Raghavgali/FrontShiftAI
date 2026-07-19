@@ -67,7 +67,12 @@ except Exception:
     memory=4096,
     timeout=3600,  # 1 hour max per session
 )
-def voice_worker_for_room(room_name: str, session_id: str):
+def voice_worker_for_room(
+    room_name: str,
+    session_id: str,
+    max_restarts: int = 2,
+    heartbeat_timeout: float = 60.0,
+) -> None:
     """
     Voice agent worker that handles a specific room.
     
@@ -75,46 +80,37 @@ def voice_worker_for_room(room_name: str, session_id: str):
     Spawned on-demand when a user creates a voice session.
     """
     import sys
-    import subprocess
-    
+
     sys.path.insert(0, "/root/voice_pipeline")
-    
-    os.environ["VOICE_PIPELINE_LOG_LEVEL"] = os.getenv("VOICE_PIPELINE_LOG_LEVEL", "INFO")
-    os.environ["VOICE_PIPELINE_LOG_TO_FILE"] = "0"
-    # Pass room name to agent via environment (optional, agent will auto-join)
-    os.environ["LIVEKIT_TARGET_ROOM"] = room_name
-    os.environ["VOICE_SESSION_ID"] = session_id
-    
-    print("=" * 60)
-    print(f"🚀 Voice Worker Starting")
-    print("=" * 60)
-    print(f"📍 Room: {room_name}")
-    print(f"📍 Session ID: {session_id}")
-    print(f"📍 Backend URL: {os.getenv('VOICE_AGENT_BACKEND_URL')}")
-    print(f"🎙️  LiveKit URL: {os.getenv('LIVEKIT_URL')}")
-    print("=" * 60)
-    
-    # Run the voice agent using LiveKit CLI
-    # The agent will automatically join rooms when participants connect
+    from utils.process_supervisor import run_supervised_process
+
+    worker_env = os.environ.copy()
+    worker_env["VOICE_PIPELINE_LOG_LEVEL"] = os.getenv(
+        "VOICE_PIPELINE_LOG_LEVEL", "INFO"
+    )
+    worker_env["VOICE_PIPELINE_LOG_TO_FILE"] = "0"
+    worker_env["VOICE_SESSION_ID"] = session_id
+    worker_env["PYTHONUNBUFFERED"] = "1"
+
+    # ``connect`` is LiveKit's single-session mode. Unlike ``start``, it
+    # connects this on-demand Modal function directly to the requested room
+    # and exits when that room job ends.
     cmd = [
         sys.executable,
+        "-u",
         "/root/voice_pipeline/scripts/main.py",
-        "start",
+        "connect",
+        "--room",
+        room_name,
     ]
-    
-    try:
-        subprocess.run(
-            cmd,
-            cwd="/root/voice_pipeline/scripts",
-            check=True,
-            env=os.environ.copy()
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Worker failed with exit code {e.returncode}")
-        raise
-    except Exception as e:
-        print(f"❌ Worker error: {e}")
-        raise
+
+    run_supervised_process(
+        cmd,
+        cwd="/root/voice_pipeline/scripts",
+        env=worker_env,
+        max_restarts=max_restarts,
+        heartbeat_timeout=heartbeat_timeout,
+    )
 
 
 # ============================================================================

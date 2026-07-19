@@ -413,6 +413,17 @@ def _build_tts_chain(chain_cfg: ProviderChainConfig):
     return _build_chain(chain_cfg, _build_tts_provider, tts.FallbackAdapter)
 
 
+async def _emit_worker_heartbeat(interval_seconds: float = 30.0) -> None:
+    """Emit output so the Modal watchdog knows the event loop is responsive."""
+    try:
+        while True:
+            logger.info("WORKER_HEARTBEAT")
+            await _asyncio.sleep(interval_seconds)
+    except _asyncio.CancelledError:
+        logger.info("Worker heartbeat stopped")
+        raise
+
+
 def extract_user_token_from_room(room) -> Optional[Dict[str, Any]]:
     """
     Extract user token and metadata from room participants.
@@ -926,7 +937,7 @@ async def entrypoint(ctx: JobContext):
     3. Extract JWT and initialize agent with user's token
     4. Start voice session
     """
-    session_id = uuid.uuid4().hex
+    session_id = os.getenv("VOICE_SESSION_ID") or uuid.uuid4().hex
     wandb_logger = WandbLogger(session_id=session_id)
     
     logger.info(f"🎯 Starting voice session: {session_id}")
@@ -1057,6 +1068,54 @@ async def entrypoint(ctx: JobContext):
 
         _play_unavailable_prompt()
 
+    heartbeat_task: Optional[_asyncio.Task] = None
+    cleanup_task: Optional[_asyncio.Task] = None
+
+    async def _cleanup_resources() -> None:
+        nonlocal heartbeat_task
+
+        task = heartbeat_task
+        heartbeat_task = None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except _asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Worker heartbeat task failed")
+
+        try:
+            await agent.backend.close()
+        except Exception:
+            logger.exception("Failed to close backend HTTP client")
+
+        if background_audio:
+            try:
+                await background_audio.aclose()
+            except Exception:
+                logger.exception("Failed to close background audio")
+
+        if wandb_logger:
+            try:
+                wandb_logger.finish()
+            except Exception:
+                logger.exception("Failed to finish W&B logger")
+
+    def _ensure_cleanup_task() -> _asyncio.Task:
+        nonlocal cleanup_task
+        if cleanup_task is None:
+            cleanup_task = _asyncio.create_task(_cleanup_resources())
+        return cleanup_task
+
+    async def _shutdown_cleanup() -> None:
+        await _ensure_cleanup_task()
+
+    add_shutdown_callback = getattr(ctx, "add_shutdown_callback", None)
+    if callable(add_shutdown_callback):
+        add_shutdown_callback(_shutdown_cleanup)
+
     @session.on("close")
     def on_close(ev: CloseEvent) -> None:
         logger.info(f"Voice session closing: {ev.reason}")
@@ -1068,25 +1127,16 @@ async def entrypoint(ctx: JobContext):
             except Exception:  # noqa: BLE001
                 pass
 
-        async def _cleanup():
+        _ensure_cleanup_task()
+
+        shutdown_job = getattr(ctx, "shutdown", None)
+        if callable(shutdown_job):
             try:
-                await agent.backend.close()
+                shutdown_job(reason=f"Voice session closed: {ev.reason}")
             except Exception:
-                logger.exception("Failed to close backend HTTP client")
+                logger.exception("Failed to request LiveKit job shutdown")
 
-            if background_audio:
-                try:
-                    await background_audio.aclose()
-                except Exception:
-                    pass
-            if wandb_logger:
-                try:
-                    wandb_logger.finish()
-                except Exception:
-                    pass
-
-        asyncio.create_task(_cleanup())
-
+    heartbeat_task = _asyncio.create_task(_emit_worker_heartbeat())
     try:
         # Phase 7B: count the session as active before start() so a hung
         # start() still shows up on the dashboard rather than vanishing.
@@ -1104,6 +1154,14 @@ async def entrypoint(ctx: JobContext):
             except Exception:  # noqa: BLE001
                 pass
         _voice_error_inc("livekit")
+        await _ensure_cleanup_task()
+
+        shutdown_job = getattr(ctx, "shutdown", None)
+        if callable(shutdown_job):
+            try:
+                shutdown_job(reason="Voice session failed to start")
+            except Exception:
+                logger.exception("Failed to request LiveKit job shutdown")
         return
 
     # Generate greeting
