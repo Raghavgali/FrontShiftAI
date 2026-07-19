@@ -64,7 +64,16 @@ jobs:
           cd backend
           pytest tests/test_schemas/ -v --cov=schemas --cov-report=term
         continue-on-error: true
-      
+
+      # Required: concurrency/security regression suite (idempotency
+      # reserve-then-execute, tenant fail-closed filter, refresh-token
+      # atomic rotation). Deterministic, no external services.
+      - name: Security regression tests (required)
+        run: |
+          cd backend
+          pytest tests/test_security/ -v
+        continue-on-error: false
+
       - name: Run all backend tests with coverage
         run: |
           cd backend

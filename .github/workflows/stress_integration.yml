@@ -1,0 +1,77 @@
+name: Integration & Stress Tests
+
+# Manually triggered: these tests exercise a LIVE deployment (latency
+# percentiles, SSE streaming, concurrency) and need real credentials.
+# Configure repository secrets:
+#   STRESS_TEST_BACKEND_URL   e.g. https://frontshiftai-backend-....run.app
+#   STRESS_TEST_JWT           a valid access token for a test tenant user
+#   STRESS_TEST_JWT_TENANT_B  (optional) second-tenant token for isolation tests
+#
+# Each run uploads a benchmark artifact (raw log + summary). To preserve
+# evidence in-repo, copy the summary into docs/benchmarks/ using the
+# template and commit it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_filter:
+        description: "pytest -k filter (empty runs everything)"
+        required: false
+        default: ""
+
+jobs:
+  stress:
+    runs-on: ubuntu-latest
+    env:
+      STRESS_TEST_BACKEND_URL: ${{ secrets.STRESS_TEST_BACKEND_URL }}
+      STRESS_TEST_JWT: ${{ secrets.STRESS_TEST_JWT }}
+      STRESS_TEST_JWT_TENANT_B: ${{ secrets.STRESS_TEST_JWT_TENANT_B }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install stress test dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r stress_tests/requirements.txt
+
+      - name: Run integration & stress suites
+        run: |
+          mkdir -p benchmark-results
+          {
+            echo "# Benchmark run"
+            echo "- Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Runner: ${RUNNER_OS} (GitHub-hosted)"
+            echo "- Target: (see STRESS_TEST_BACKEND_URL secret; not echoed)"
+            echo "- Filter: '${{ github.event.inputs.test_filter }}'"
+            echo ""
+          } | tee benchmark-results/summary.md
+          set -o pipefail
+          if [ -n "${{ github.event.inputs.test_filter }}" ]; then
+            pytest stress_tests/ -v -s -k "${{ github.event.inputs.test_filter }}" 2>&1 | tee benchmark-results/run.log
+          else
+            pytest stress_tests/ -v -s 2>&1 | tee benchmark-results/run.log
+          fi
+
+      - name: Append result tail to summary
+        if: always()
+        run: |
+          echo '## Result tail' >> benchmark-results/summary.md
+          echo '```' >> benchmark-results/summary.md
+          tail -40 benchmark-results/run.log >> benchmark-results/summary.md
+          echo '```' >> benchmark-results/summary.md
+
+      - name: Upload benchmark artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ github.run_id }}
+          path: benchmark-results/
+          retention-days: 90
