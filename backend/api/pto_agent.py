@@ -6,10 +6,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List
+import json
 import logging
 import time  # ADD THIS
 
+from sse_starlette import EventSourceResponse
+
 from db.connection import get_db
+from db.tenant_context import set_tenant_context, clear_tenant_context
 from db.models import User, PTORequest, PTOBalance, PTOStatus
 from schemas.pto import (
     AgentChatRequest,
@@ -109,6 +113,115 @@ async def chat_with_agent(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process your request. Please try again."
         )
+
+
+@router.post("/chat/stream")
+async def chat_with_agent_stream(
+    request: AgentChatRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    idem: IdempotencyGuard = Depends(idempotency_guard),
+):
+    """
+    Chat with PTO agent, streaming per-node progress as SSE.
+
+    Events: `status` per LangGraph node (with stage name and optional
+    extras like remaining_days), then `done` with the same body as
+    POST /api/pto/chat. Errors emit an `error` event.
+    """
+    user_email = current_user["email"]
+    company = current_user["company"]
+    is_admin = current_user.get("role") == "super_admin"
+
+    # Same endpoint key as the batch route: a stream that completed the
+    # mutation dedupes a subsequent batch retry with the same key (and
+    # vice versa).
+    cached = idem.lookup(db, company, endpoint="/api/pto/chat")
+
+    async def event_stream():
+        # The tenant ContextVar set by middleware is cleared before this
+        # generator body runs (it executes after call_next returns), so
+        # re-establish it for all DB access below (Phase 0.6 auto-filter).
+        set_tenant_context(company=company, is_super_admin=is_admin)
+        start_time = time.time()
+        try:
+            if cached is not None:
+                yield {"event": "done", "data": json.dumps(cached)}
+                return
+
+            agent = PTOAgent(db)
+            result = None
+            async for kind, payload in agent.execute_stream(
+                user_email=user_email, company=company, message=request.message
+            ):
+                if kind == "status":
+                    yield {"event": "status", "data": json.dumps(payload)}
+                else:
+                    result = payload
+
+            execution_time_ms = (time.time() - start_time) * 1000
+            if result is None or result.get("error"):
+                production_monitor.log_agent_execution(
+                    agent_name="pto",
+                    execution_time_ms=execution_time_ms,
+                    success=False,
+                    company_id=company,
+                )
+                yield {
+                    "event": "error",
+                    "data": json.dumps({
+                        "detail": (result or {}).get("error", "agent produced no result"),
+                        "response": (result or {}).get(
+                            "response",
+                            "Failed to process your request. Please try again.",
+                        ),
+                    }),
+                }
+                return
+
+            production_monitor.log_agent_execution(
+                agent_name="pto",
+                execution_time_ms=execution_time_ms,
+                success=True,
+                company_id=company,
+            )
+            response = AgentChatResponse(
+                response=result["response"],
+                request_created=result.get("request_created", False),
+                request_id=result.get("request_id"),
+                balance_info=result.get("balance_info"),
+            )
+            body = response.model_dump(mode="json")
+            idem.store(
+                db,
+                company,
+                endpoint="/api/pto/chat",
+                status_code=200,
+                body=body,
+            )
+            yield {"event": "done", "data": json.dumps(body)}
+
+        except Exception as e:
+            logger.error(f"Error in PTO agent stream: {e}", exc_info=True)
+            yield {
+                "event": "error",
+                "data": json.dumps({
+                    "detail": str(e),
+                    "response": "Failed to process your request. Please try again.",
+                }),
+            }
+        finally:
+            clear_tenant_context()
+
+    return EventSourceResponse(
+        event_stream(),
+        ping=15,
+        send_timeout=10,
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/balance", response_model=PTOBalanceResponse)

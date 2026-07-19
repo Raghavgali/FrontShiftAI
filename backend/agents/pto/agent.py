@@ -135,22 +135,9 @@ class PTOAgent:
         else:
             return "failed"
     
-    async def execute(self, user_email: str, company: str, message: str) -> Dict[str, Any]:
-        """
-        Execute the PTO agent workflow
-        
-        Args:
-            user_email: User's email
-            company: User's company
-            message: User's message/request
-            
-        Returns:
-            Dictionary with agent response and metadata
-        """
-        logger.info(f"Executing PTO agent for user: {user_email}")
-        
-        # Initialize state
-        initial_state = PTOAgentState(
+    def _initial_state(self, user_email: str, company: str, message: str) -> PTOAgentState:
+        """Build the fully-populated initial graph state."""
+        return PTOAgentState(
             user_email=user_email,
             company=company,
             user_message=message,
@@ -176,26 +163,83 @@ class PTOAgent:
             should_end=False,
             error_message=None
         )
-        
+
+    @staticmethod
+    def _result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+        """Shape the API result dict from a (final) graph state."""
+        return {
+            "response": state["agent_response"],
+            "request_created": state.get("request_created", False),
+            "request_id": state.get("request_id"),
+            "balance_info": {
+                "remaining_days": state.get("remaining_days"),
+                "total_days": state.get("current_balance"),
+                "used_days": state.get("used_days"),
+                "pending_days": state.get("pending_days")
+            } if state.get("remaining_days") is not None else None
+        }
+
+    async def execute(self, user_email: str, company: str, message: str) -> Dict[str, Any]:
+        """
+        Execute the PTO agent workflow
+
+        Args:
+            user_email: User's email
+            company: User's company
+            message: User's message/request
+
+        Returns:
+            Dictionary with agent response and metadata
+        """
+        logger.info(f"Executing PTO agent for user: {user_email}")
+
+        # Initialize state
+        initial_state = self._initial_state(user_email, company, message)
+
         try:
             # Run the graph
             final_state = await self.graph.ainvoke(initial_state)
-            
-            return {
-                "response": final_state["agent_response"],
-                "request_created": final_state.get("request_created", False),
-                "request_id": final_state.get("request_id"),
-                "balance_info": {
-                    "remaining_days": final_state.get("remaining_days"),
-                    "total_days": final_state.get("current_balance"),
-                    "used_days": final_state.get("used_days"),
-                    "pending_days": final_state.get("pending_days")
-                } if final_state.get("remaining_days") is not None else None
-            }
-            
+
+            return self._result_from_state(final_state)
+
         except Exception as e:
             logger.error(f"Error executing PTO agent: {e}")
             return {
+                "response": "I encountered an error processing your request. Please try again or contact support.",
+                "request_created": False,
+                "request_id": None,
+                "balance_info": None,
+                "error": str(e)
+            }
+
+    async def execute_stream(self, user_email: str, company: str, message: str):
+        """
+        Execute the PTO agent workflow, streaming per-node progress.
+
+        Yields ("status", payload) tuples as each LangGraph node completes,
+        then a final ("done", result) with the same shape as execute().
+        """
+        logger.info(f"Streaming PTO agent for user: {user_email}")
+
+        state: Dict[str, Any] = dict(self._initial_state(user_email, company, message))
+
+        try:
+            async for update in self.graph.astream(state, stream_mode="updates"):
+                for node_name, delta in update.items():
+                    if isinstance(delta, dict):
+                        state.update(delta)
+                    payload: Dict[str, Any] = {"stage": node_name}
+                    if node_name == "check_balance" and state.get("remaining_days") is not None:
+                        payload["remaining_days"] = state.get("remaining_days")
+                    if node_name == "create_request" and state.get("request_id"):
+                        payload["request_id"] = state.get("request_id")
+                    yield "status", payload
+
+            yield "done", self._result_from_state(state)
+
+        except Exception as e:
+            logger.error(f"Error streaming PTO agent: {e}")
+            yield "done", {
                 "response": "I encountered an error processing your request. Please try again or contact support.",
                 "request_created": False,
                 "request_id": None,
