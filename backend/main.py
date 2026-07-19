@@ -14,6 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import uvicorn
+import asyncio
 
 
 # Silence noisy upstream deprecation warnings we can't fix at our layer.
@@ -79,6 +80,10 @@ def _validate_chromadb_tenant_labels(collection, sample_size: int = 1000) -> Non
                 "ChromaDB tenant-label validator: found chunk with missing/empty "
                 f"'company' metadata (sample meta={meta!r}). Refusing to start."
             )
+
+# Phase 3D: active-request counter, maintained by middleware and read by
+# the lifespan shutdown drain. Single event loop, so a plain int is safe.
+_inflight_requests = 0
 
 # ----------------------------
 # Lifespan Events
@@ -151,7 +156,19 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    print("👋 FrontShiftAI API shutting down...")
+    # Phase 3D: drain in-flight requests before the process exits. Waits
+    # only as long as traffic is actually outstanding, capped at 10s so a
+    # stuck stream can't block the deploy.
+    logger.info("Shutting down - draining in-flight requests")
+    deadline = time.time() + 10
+    while _inflight_requests > 0 and time.time() < deadline:
+        await asyncio.sleep(0.1)
+    if _inflight_requests > 0:
+        logger.warning(
+            f"Shutdown proceeding with {_inflight_requests} requests still in flight"
+        )
+    else:
+        logger.info("All in-flight requests drained")
 
 # ----------------------------
 # FASTAPI APP
@@ -162,6 +179,17 @@ app = FastAPI(
     description="Multi-company RAG system with unified AI agents",
     lifespan=lifespan
 )
+
+
+@app.middleware("http")
+async def _track_inflight_requests(request: Request, call_next):
+    """Phase 3D: count active requests so shutdown can drain them."""
+    global _inflight_requests
+    _inflight_requests += 1
+    try:
+        return await call_next(request)
+    finally:
+        _inflight_requests -= 1
 
 # ----------------------------
 # ERROR HANDLING
