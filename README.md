@@ -350,7 +350,7 @@ This is a personal project; external contributions aren't expected, but if you f
 
 The original codebase was a team coursework submission. The production hardening below is individually directed by [Raghav Gali](https://github.com/Raghavgali), who authored the structured plan (see [`plan.md`](./plan.md) and [`system_design.md`](./system_design.md)) and owns the architecture, integration, testing, and review of every phase; AI coding tools accelerated portions of the implementation.
 
-**What the status column means**: "Implemented" means the code is written, unit-tested where deterministic tests exist (see `backend/tests/`, run in CI on every push), and exercised locally. Latency and resilience targets are only considered *validated* once a recorded benchmark exists in [`docs/benchmarks/`](./docs/benchmarks/) (produced by the gated **Integration & Stress Tests** workflow, which needs a live deployment and credentials). No benchmark runs are recorded yet.
+**What the status column means**: "Implemented" means the code is written, unit-tested where deterministic tests exist (see `backend/tests/`, run in the CI test workflows), and exercised locally. Latency and resilience targets are only considered *validated* once a recorded benchmark exists in [`docs/benchmarks/`](./docs/benchmarks/) (produced by the gated **Integration & Stress Tests** workflow, which needs a live deployment and credentials). No benchmark runs are recorded yet.
 
 Status as of this README:
 
