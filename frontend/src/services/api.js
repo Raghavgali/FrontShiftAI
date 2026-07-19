@@ -145,6 +145,102 @@ export const ragQuery = async (query, companyName = null, topK = 4) => {
   }
 };
 
+// -------------- SSE streaming (Phase 2) --------------
+//
+// EventSource cannot send an Authorization header, so streaming uses
+// fetch + ReadableStream with the same bearer token as axios. Handles one
+// refresh-on-401 round trip via the shared performRefresh().
+
+async function consumeSSE(path, body, handlers = {}, retriedAfterRefresh = false) {
+  const token = localStorage.getItem('access_token');
+  if (!token) throw new Error('Not authenticated');
+
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+      Accept: 'text/event-stream',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (response.status === 401 && !retriedAfterRefresh) {
+    refreshPromise = refreshPromise || performRefresh().finally(() => { refreshPromise = null; });
+    await refreshPromise;
+    return consumeSSE(path, body, handlers, true);
+  }
+  if (!response.ok || !response.body) {
+    throw new Error(`Stream request failed: ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let eventName = 'message';
+  let dataLines = [];
+
+  const dispatch = () => {
+    if (!dataLines.length) return;
+    const raw = dataLines.join('\n');
+    let data;
+    try { data = JSON.parse(raw); } catch { data = raw; }
+    handlers[eventName]?.(data);
+    eventName = 'message';
+    dataLines = [];
+  };
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, idx).replace(/\r$/, '');
+      buffer = buffer.slice(idx + 1);
+      if (line.startsWith(':')) continue; // SSE heartbeat/comment
+      if (line.startsWith('event:')) { eventName = line.slice(6).trim(); continue; }
+      if (line.startsWith('data:')) { dataLines.push(line.slice(5).trim()); continue; }
+      if (line === '') dispatch();
+    }
+  }
+  dispatch();
+}
+
+// Streaming RAG query: onSources -> onToken (per token) -> onDone (timings).
+export const ragQueryStream = async (
+  query,
+  { topK = 4, maxTokens = null, generationBackend = null, onSources, onToken, onDone, onError } = {}
+) => {
+  const body = { query, top_k: topK };
+  if (maxTokens) body.max_tokens = maxTokens;
+  if (generationBackend) body.generation_backend = generationBackend;
+  return consumeSSE('/api/rag/query/stream', body, {
+    sources: onSources,
+    token: onToken,
+    done: onDone,
+    error: onError,
+  });
+};
+
+// Streaming PTO agent chat: onStatus per LangGraph node (typing indicators),
+// onDone with the same body as ptoChatAgent().
+export const ptoChatAgentStream = (message, { onStatus, onDone, onError } = {}) =>
+  consumeSSE('/api/pto/chat/stream', { message }, {
+    status: onStatus,
+    done: onDone,
+    error: onError,
+  });
+
+// Streaming HR ticket agent chat: same event contract as PTO.
+export const hrTicketChatAgentStream = (message, { onStatus, onDone, onError } = {}) =>
+  consumeSSE('/api/hr-tickets/chat/stream', { message }, {
+    status: onStatus,
+    done: onDone,
+    error: onError,
+  });
+
 // -------------- Health Check --------------
 export const healthCheck = async () => {
   try {
