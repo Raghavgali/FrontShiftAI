@@ -78,3 +78,8 @@ frontshiftai-c98c983486fd.json
 frontshiftai-dvc-sa.json
 chat_pipeline/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf
 fallback
+# Claude Code workspace files (never commit)
+.claude/
+claude.md
+CLAUDE.md
+graphify-out/
