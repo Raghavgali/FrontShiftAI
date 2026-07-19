@@ -25,4 +25,6 @@ livekit:
        model: "sonic-2"
   vad:
     provider: "silero"
-    kwargs: {}
+    kwargs:
+      min_silence_duration: 0.3
+      min_speech_duration: 0.1
