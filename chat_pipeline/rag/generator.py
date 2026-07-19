@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import os
 import time
@@ -478,6 +479,117 @@ def _call_groq_api(prompt: str, params: Dict[str, Any]) -> str:
     raise RuntimeError("Groq API failed after multiple attempts.") from last_exc
 
 
+def _stream_openai_compatible_api(
+    url: str,
+    api_key: Optional[str],
+    provider: str,
+    model: str,
+    prompt: str,
+    params: Dict[str, Any],
+) -> Generator[str, None, None]:
+    """POST an OpenAI-compatible chat/completions request with ``stream: true``
+    and yield content deltas as they arrive.
+
+    Raises before the first yield on connect/auth/HTTP errors so the backend
+    fallback chain in :func:`stream_response` can still advance. A failure
+    after tokens have been yielded re-raises — the caller owns partial-output
+    handling (Phase 2C).
+    """
+    if not api_key:
+        raise RuntimeError(f"{provider} API key is not set; cannot stream from {provider}.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    system_msg = params.get("system_message")
+    user_msg = params.get("user_message")
+
+    messages = []
+    if system_msg and user_msg:
+        messages.append({"role": "system", "content": system_msg})
+        messages.append({"role": "user", "content": user_msg})
+    else:
+        messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": params.get("max_tokens"),
+        "temperature": params.get("temperature"),
+        "top_p": params.get("top_p"),
+        "stream": True,
+    }
+
+    call_start = time.perf_counter()
+    try:
+        with httpx.Client(timeout=REMOTE_TIMEOUT) as client:
+            with client.stream("POST", url, json=payload, headers=headers) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = (choices[0].get("delta") or {}).get("content")
+                    if delta:
+                        yield delta
+        _emit_llm_metric(
+            "observe_llm_call", provider, "success", time.perf_counter() - call_start
+        )
+    except Exception as exc:
+        _emit_llm_metric(
+            "observe_llm_call",
+            provider,
+            "error",
+            time.perf_counter() - call_start,
+            _classify_error(exc),
+        )
+        raise
+
+
+def _stream_groq_api(prompt: str, params: Dict[str, Any]) -> Generator[str, None, None]:
+    yield from _stream_openai_compatible_api(
+        "https://api.groq.com/openai/v1/chat/completions",
+        GROQ_API_KEY,
+        "groq",
+        GROQ_MODEL,
+        prompt,
+        params,
+    )
+
+
+def _stream_mercury_api(prompt: str, params: Dict[str, Any]) -> Generator[str, None, None]:
+    yield from _stream_openai_compatible_api(
+        f"{INCEPTION_API_BASE}/chat/completions",
+        INCEPTION_API_KEY,
+        "mercury",
+        MERCURY_MODEL,
+        prompt,
+        params,
+    )
+
+
+def _stream_openai_api(prompt: str, params: Dict[str, Any]) -> Generator[str, None, None]:
+    yield from _stream_openai_compatible_api(
+        "https://api.openai.com/v1/chat/completions",
+        os.getenv("OPENAI_API_KEY"),
+        "openai",
+        os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        prompt,
+        params,
+    )
+
+
 def _call_openai_api(prompt: str, params: Dict[str, Any]) -> str:
     """Call the OpenAI API as a backend."""
 
@@ -576,20 +688,30 @@ def get_last_backend_used() -> Optional[str]:
 def stream_response(
     prompt: str,
     llm: Optional[Any] = None,
+    generation_backend: Optional[str] = None,
+    stream_tokens: bool = False,
     **stream_overrides: Any,
 ) -> Generator[str, None, None]:
-    """Stream the model output token-by-token as it is generated, with fallback support."""
+    """Stream the model output token-by-token as it is generated, with fallback support.
+
+    With ``stream_tokens=False`` (default) each remote backend yields its full
+    answer as a single chunk. With ``stream_tokens=True`` the remote call uses
+    the provider's SSE streaming API and yields incremental deltas — required
+    by the Phase 2 streaming endpoints for real TTFT gains.
+    """
 
     _record_backend(None)
     params = _get_streaming_hyperparameters(stream_overrides)
     gen_cfg = get_generation_config()
-    
-    # Priority order: Configured backend -> Mercury -> Groq -> OpenAI -> Local
+
+    # Priority order: Per-call backend -> Configured backend -> Mercury -> Groq -> OpenAI -> Local
     # If the user specifically set GENERATION_BACKEND, we try ONLY that first, but we can implement fallbacks even then if desired.
     # However, for this requirement: "if rag is triggered - LLM used is mercury, with groq and lopenai as a fallback"
     # We will enforce this order if 'auto' or unset.
-    
-    configured_backend = (GENERATION_BACKEND or gen_cfg.get("backend") or "auto").lower()
+
+    configured_backend = (
+        generation_backend or GENERATION_BACKEND or gen_cfg.get("backend") or "auto"
+    ).lower()
 
     # Define the chain based on user requirement
     # Mercury -> Groq -> OpenAI -> Local (via 'auto'/'local' check)
@@ -611,24 +733,42 @@ def stream_response(
             
     # Now try them in order
     last_error = None
-    
+    emitted_any = False
+
+    def _tracked(gen: Iterable[str]) -> Generator[str, None, None]:
+        # Marks that output reached the caller, so a mid-stream failure must
+        # NOT fall through to another backend (it would duplicate content).
+        nonlocal emitted_any
+        for chunk in gen:
+            emitted_any = True
+            yield chunk
+
     for backend in chain:
         try:
             logger.info(f"Attempting generation with backend: {backend}")
             
             if backend == "groq":
                 _record_backend("groq")
-                yield _call_groq_api(prompt, params)
+                if stream_tokens:
+                    yield from _tracked(_stream_groq_api(prompt, params))
+                else:
+                    yield _call_groq_api(prompt, params)
                 return
 
             if backend == "openai":
                 _record_backend("openai")
-                yield _call_openai_api(prompt, params)
+                if stream_tokens:
+                    yield from _tracked(_stream_openai_api(prompt, params))
+                else:
+                    yield _call_openai_api(prompt, params)
                 return
 
             if backend == "mercury":
                 _record_backend("mercury")
-                yield _call_mercury_api(prompt, params)
+                if stream_tokens:
+                    yield from _tracked(_stream_mercury_api(prompt, params))
+                else:
+                    yield _call_mercury_api(prompt, params)
                 return
                 
             if backend == "local":
@@ -643,12 +783,17 @@ def stream_response(
                          
                  if local_llm is not None:
                     _record_backend("local")
-                    yield from _stream_from_local_llm(local_llm, prompt, params)
+                    yield from _tracked(_stream_from_local_llm(local_llm, prompt, params))
                     return
-        
+
         except KeyboardInterrupt:
             raise
         except Exception as e:
+            if emitted_any:
+                logger.error(
+                    f"Backend {backend} failed mid-stream after emitting output: {e}"
+                )
+                raise
             logger.warning(f"Backend {backend} failed: {e}")
             last_error = e
             continue
@@ -801,6 +946,7 @@ def generation(
     template_key: Optional[str] = None,
     stream: bool = False,
     streaming_overrides: Optional[Dict[str, Any]] = None,
+    generation_backend: Optional[str] = None,
     llm: Optional[Any] = None,
     max_documents: Optional[int] = None,
     documents: Optional[List[str]] = None,
@@ -830,6 +976,9 @@ def generation(
         fully materialised string.
     streaming_overrides:
         Optional overrides for streaming hyperparameters.
+    generation_backend:
+        Optional per-call backend override (``"mercury"``, ``"groq"``,
+        ``"openai"``, ``"local"``). Falls back to env/config when unset.
     llm:
         Pass an already-loaded ``llama_cpp.Llama`` instance (skips reloads).
     max_documents:
@@ -880,6 +1029,8 @@ def generation(
     response_iter = stream_response(
         prompt,
         llm=llm,
+        generation_backend=generation_backend,
+        stream_tokens=stream,
         **overrides,
     )
 
