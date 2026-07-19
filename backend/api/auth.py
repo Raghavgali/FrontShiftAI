@@ -208,9 +208,26 @@ def refresh(request: RefreshRequest, db: Session = Depends(get_db)):
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User no longer exists")
 
-    # Revoke old, issue new (rotation-on-use).
-    record.revoked_at = datetime.now(timezone.utc)
+    # Revoke old, issue new (rotation-on-use). The revocation is an atomic
+    # conditional UPDATE (... WHERE revoked_at IS NULL) so of N concurrent
+    # refreshes with the same token exactly one wins the claim. Losers are
+    # treated as replays: without this, simultaneous refreshes could each
+    # pass the revoked_at check above and mint sibling token chains.
+    claimed = (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.id == record.id,
+            RefreshToken.revoked_at.is_(None),
+        )
+        .update({"revoked_at": datetime.now(timezone.utc)}, synchronize_session=False)
+    )
     db.commit()
+    if claimed == 0:
+        _revoke_chain(db, record.id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token reuse detected; chain revoked",
+        )
 
     new_refresh = _issue_refresh_token(
         db,
