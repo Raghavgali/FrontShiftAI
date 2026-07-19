@@ -79,6 +79,34 @@ jobs:
             --max-instances 10 \
             --min-instances 0
 
+      - name: Verify deployment health
+        run: |
+          SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" \
+            --region "$REGION" --format 'value(status.url)')
+          echo "Probing $SERVICE_URL/health/ready"
+          for i in $(seq 1 18); do
+            STATUS=$(curl -s -o /dev/null --max-time 10 -w "%{http_code}" \
+              "$SERVICE_URL/health/ready")
+            if [ "$STATUS" = "200" ]; then
+              echo "Healthy after ~$((i * 5))s"
+              exit 0
+            fi
+            echo "Attempt $i/18: /health/ready returned $STATUS"
+            sleep 5
+          done
+          echo "Health check failed - rolling back to previous revision"
+          PREV_REVISION=$(gcloud run revisions list --service "$SERVICE_NAME" \
+            --region "$REGION" --format 'value(metadata.name)' \
+            --sort-by '~metadata.creationTimestamp' | sed -n 2p)
+          if [ -n "$PREV_REVISION" ]; then
+            gcloud run services update-traffic "$SERVICE_NAME" --region "$REGION" \
+              --to-revisions "$PREV_REVISION=100"
+            echo "Traffic routed back to $PREV_REVISION"
+          else
+            echo "No previous revision exists - nothing to roll back to"
+          fi
+          exit 1
+
       - name: Show deployment URL
         run: |
           echo "Deployment successful!"
