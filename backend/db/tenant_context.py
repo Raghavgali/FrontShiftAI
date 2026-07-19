@@ -16,6 +16,16 @@ silently skips auto-filtering. That way we don't break login (which queries
 
 **Super-admin bypass**: use ``bypass_tenant_filter(reason, actor)`` as a
 context manager. Every use produces an audit log entry tagged ``tenant_bypass``.
+
+**Fail-closed**: if the filter cannot be applied to a query it raises instead
+of passing the query through unfiltered. A 500 is preferable to a cross-tenant
+leak.
+
+**Known limitation**: ``Query.before_compile`` covers the legacy ``db.query()``
+API, which is the only ORM query style used in this codebase (verified: no
+``session.execute(select(...))`` call sites outside raw health checks). If 2.0
+``select()`` statements are ever introduced, this listener must be extended
+with a ``Session.do_orm_execute`` hook using ``with_loader_criteria``.
 """
 from __future__ import annotations
 
@@ -101,9 +111,23 @@ def _auto_filter_by_company(query: Query) -> Query:
             if model is None:
                 continue
             # Only filter if the model actually has a ``company`` column.
+            # enable_assertions(False) is required so the filter can still be
+            # applied to queries that already carry LIMIT/OFFSET (.first(),
+            # .limit()); without it, Query.filter() raises on those and every
+            # such query used to slip through UNFILTERED under the old
+            # fail-open error handling.
             if hasattr(model, "company"):
-                query = query.filter(model.company == company)
-    except Exception as exc:  # pragma: no cover - defensive: never break queries
-        logger.error("tenant auto-filter failed, passing query through: %s", exc)
+                query = query.enable_assertions(False).filter(model.company == company)
+    except Exception as exc:
+        # FAIL CLOSED: this is a security boundary. If enforcement cannot be
+        # applied, refuse to run the query rather than risk returning another
+        # tenant's rows. The request fails with a 500, which is the correct
+        # trade-off for a tenancy filter.
+        logger.error(
+            "tenant auto-filter failed, refusing to run unfiltered query: %s",
+            exc,
+            extra={"audit": True, "event": "tenant_filter_failure"},
+        )
+        raise RuntimeError("Tenant filter enforcement failed; query aborted") from exc
 
     return query
