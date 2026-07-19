@@ -4,16 +4,16 @@
 
 **AI Concierge for the Deskless Workforce**
 
-![Python](https://img.shields.io/badge/Python-3.12+-blue) ![React](https://img.shields.io/badge/React-18.2-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.104-green) ![Docker](https://img.shields.io/badge/Docker-Enabled-blue) ![GCP](https://img.shields.io/badge/GCP-Cloud%20Run-orange)
+![Python](https://img.shields.io/badge/Python-3.12+-blue) ![React](https://img.shields.io/badge/React-18.2-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.104-green) ![Docker](https://img.shields.io/badge/Docker-Enabled-blue) ![GCP](https://img.shields.io/badge/GCP-Cloud%20Run-orange) [![Backend CI](https://github.com/Raghavgali/FrontShiftAI/actions/workflows/test_backend.yml/badge.svg)](https://github.com/Raghavgali/FrontShiftAI/actions/workflows/test_backend.yml)
 
-> **Owned and maintained by [Raghav Gali](https://github.com/Raghavgali).** The original application was built as team coursework at Northeastern University; everything since is a solo effort. I designed and am implementing the full production-readiness overhaul: critical resilience fixes, idempotency keys, multi-tenant isolation hardening, JWT refresh-token rotation, a resilience policy matrix with circuit breakers, Prometheus + Grafana observability with SLOs, and the latency + SSE streaming rework across backend, voice pipeline, and frontend. See the **[Production Readiness Roadmap](#production-readiness-roadmap)** for the phase-by-phase record, [`plan.md`](./plan.md) for the engineering plan, and the commit history for the implementation trail.
+> This repository is an individually directed, AI-assisted continuation of a Northeastern University team capstone (MLOps Group 9), owned and maintained by [Raghav Gali](https://github.com/Raghavgali). I own the production-readiness roadmap, architecture decisions, integration, testing, review, and maintenance of all post-coursework changes; AI coding tools accelerated portions of the implementation, and the AI co-author trailers in the commit history reflect that transparently. The overhaul covers critical resilience fixes, idempotency, multi-tenant isolation hardening, JWT refresh-token rotation, circuit breakers, Prometheus + Grafana observability with SLOs, and the latency + SSE streaming rework. See the **[Production Readiness Roadmap](#production-readiness-roadmap)** for the phase-by-phase record and [`plan.md`](./plan.md) for the engineering plan.
 
 ---
 
 ## Video Demo
 
 
-[![Watch the Demo](https://img.youtube.com/vi/PLACEHOLDER/0.jpg)](https://drive.google.com/drive/folders/1-BDy_7jMf0nWLNDfPSK6pi_NX8RqyYpC?usp=sharing)
+▶️ **[Watch the demo (Google Drive)](https://drive.google.com/drive/folders/1-BDy_7jMf0nWLNDfPSK6pi_NX8RqyYpC?usp=sharing)**
 
 ---
 
@@ -53,7 +53,7 @@ The system isn't just a chatbot; it's a squad of specialized agents coordinated 
 
 ### 1.1 LLM Architecture & Resiliency
 
-To ensure 99.9% uptime and low latency, the platform employs a robust fallback strategy across different model providers:
+To maximize availability (SLO target: 99.5%, defined in [`grafana/slo.yaml`](./grafana/slo.yaml)) and keep latency low, the platform employs a robust fallback strategy across different model providers:
 
 | Component | Main LLM | Backup Chain (in order) |
 | :--- | :--- | :--- |
@@ -84,7 +84,7 @@ To ensure 99.9% uptime and low latency, the platform employs a robust fallback s
 ### 5. Real-Time Voice Interface
 
 *   **Hands-Free Interaction**: Enables nurses and field technicians to query policy and request PTO via natural conversation while working.
-*   **Latency**: ~3.4s end-to-end today (Deepgram STT/TTS + LLM + TTS), with a sub-1.5s p95 target in the active roadmap (streaming, connection pooling, Groq-first voice path).
+*   **Latency**: ~3.4s end-to-end, estimated from informal local runs (a recorded benchmark artifact is pending, see [`docs/benchmarks/`](./docs/benchmarks/)). The active roadmap targets a sub-1.5s p95 (streaming, connection pooling, Groq-first voice path); that figure is a target, not an achieved result.
 *   **Secure Authentication**: Voice sessions are fully authenticated via short-lived (1h) JWTs bridged to a 6h voice-scoped token so long conversations don't expire mid-turn.
 
 ---
@@ -348,18 +348,22 @@ This is a personal project; external contributions aren't expected, but if you f
 
 ## Production Readiness Roadmap
 
-The original codebase was a team coursework submission. The production hardening below is an individual effort by [Raghav Gali](https://github.com/Raghavgali), who authored the structured plan (see [`plan.md`](./plan.md) and [`system_design.md`](./system_design.md)) and implemented every completed phase. Status as of this README:
+The original codebase was a team coursework submission. The production hardening below is individually directed by [Raghav Gali](https://github.com/Raghavgali), who authored the structured plan (see [`plan.md`](./plan.md) and [`system_design.md`](./system_design.md)) and owns the architecture, integration, testing, and review of every phase; AI coding tools accelerated portions of the implementation.
+
+**What the status column means**: "Implemented" means the code is written, unit-tested where deterministic tests exist (see `backend/tests/`, run in CI on every push), and exercised locally. Latency and resilience targets are only considered *validated* once a recorded benchmark exists in [`docs/benchmarks/`](./docs/benchmarks/) (produced by the gated **Integration & Stress Tests** workflow, which needs a live deployment and credentials). No benchmark runs are recorded yet.
+
+Status as of this README:
 
 | Phase | Focus | Status |
 |-------|-------|--------|
-| **0 — Critical Resilience** | Block SQLite fallback in prod, fail-fast on ChromaDB/warmup failure, thread-safe caches + LLM singleton, voice tool retries with graceful fallback, 429 `Retry-After` for Mercury/OpenAI | ✅ Complete |
-| **0.5 — Idempotency Keys** | `IdempotencyRecord` table, FastAPI dependency on mutation endpoints (`/api/pto/chat`, `/api/hr-tickets/chat`, `/api/chat/message`), voice agent auto-generates and reuses keys across retries, daily Celery cleanup | ✅ Complete |
-| **0.6 — Multi-Tenant Hardening** | Request-scoped `ContextVar` + SQLAlchemy `before_compile` listener auto-filters by `company`; `bypass_tenant_filter()` ctx manager with audit log; `TenantScopedRetriever` for ChromaDB; startup validator fails fast if any chunk lacks a `company` label; GH Actions blocks raw SQL outside allow-list | ✅ Complete |
-| **0.7 — JWT Refresh Tokens** | Access-token TTL 1y → 1h; `RefreshToken` stored as SHA-256 hash; rotation-on-use with chain-burn theft detection; `/refresh`, `/logout`, `/voice-token` endpoints; frontend Axios interceptor auto-refreshes on 401 and replays the original request | ✅ Complete |
-| **6.5 — Resilience Policy Matrix** | Single source of truth for timeout / retry / backoff / circuit-breaker per call type; `@resilient(policy=…)` decorator with per-key circuit breaker; Brave Search migrated as the reference implementation | ✅ Complete |
-| **7 — Prometheus + Grafana Observability** | Backend + voice-pipeline instrumentation (four golden signals), correlation IDs, SLO definitions, six provisioned dashboards, Locust → Prometheus export | ✅ Complete |
-| **1 — Quick Wins: Latency + Resilience** | Persistent pooled HTTP client in voice `BackendClient`, silero VAD tuned (0.3s silence / 0.1s speech), tool timeouts cut (RAG 8s, others 10s), per-request `max_tokens` + `generation_backend` through schema → pipeline → generator, voice uses Groq at 256 tokens | ✅ Complete |
-| **2 — Streaming (SSE)** | Token-level streaming from Groq/Mercury/OpenAI, `POST /api/rag/query/stream` (sources/token/done events), PTO + HR agent `/chat/stream` with per-node status events, voice agent consumes streams with 10s budget + partial-answer fallback + idempotency-keyed batch retry, frontend fetch-stream client | ✅ Complete |
+| **0 — Critical Resilience** | Block SQLite fallback in prod, fail-fast on ChromaDB/warmup failure, thread-safe caches + LLM singleton, voice tool retries with graceful fallback, 429 `Retry-After` for Mercury/OpenAI | ✅ Implemented |
+| **0.5 — Idempotency Keys** | `IdempotencyRecord` table, FastAPI dependency on mutation endpoints (`/api/pto/chat`, `/api/hr-tickets/chat`, `/api/chat/message`), voice agent auto-generates and reuses keys across retries, daily Celery cleanup | ✅ Implemented |
+| **0.6 — Multi-Tenant Hardening** | Request-scoped `ContextVar` + SQLAlchemy `before_compile` listener auto-filters by `company`; `bypass_tenant_filter()` ctx manager with audit log; `TenantScopedRetriever` for ChromaDB; startup validator fails fast if any chunk lacks a `company` label; GH Actions blocks raw SQL outside allow-list | ✅ Implemented |
+| **0.7 — JWT Refresh Tokens** | Access-token TTL 1y → 1h; `RefreshToken` stored as SHA-256 hash; rotation-on-use with chain-burn theft detection; `/refresh`, `/logout`, `/voice-token` endpoints; frontend Axios interceptor auto-refreshes on 401 and replays the original request | ✅ Implemented |
+| **6.5 — Resilience Policy Matrix** | Single source of truth for timeout / retry / backoff / circuit-breaker per call type; `@resilient(policy=…)` decorator with per-key circuit breaker; Brave Search migrated as the reference implementation | ✅ Implemented |
+| **7 — Prometheus + Grafana Observability** | Backend + voice-pipeline instrumentation (four golden signals), correlation IDs, SLO definitions, six provisioned dashboards, Locust → Prometheus export | ✅ Implemented |
+| **1 — Quick Wins: Latency + Resilience** | Persistent pooled HTTP client in voice `BackendClient`, silero VAD tuned (0.3s silence / 0.1s speech), tool timeouts cut (RAG 8s, others 10s), per-request `max_tokens` + `generation_backend` through schema → pipeline → generator, voice uses Groq at 256 tokens | ✅ Implemented |
+| **2 — Streaming (SSE)** | Token-level streaming from Groq/Mercury/OpenAI, `POST /api/rag/query/stream` (sources/token/done events), PTO + HR agent `/chat/stream` with per-node status events, voice agent consumes streams with 10s budget + partial-answer fallback + idempotency-keyed batch retry, frontend fetch-stream client | ✅ Implemented |
 | **3–5 — Infra, Caching, Voice Fast Path** | Modal keep-warm, worker crash recovery, TTL caching, voice prefetch on partial STT | ⏳ Up next |
 | **5.5 — Durable LangGraph Checkpointing** | `PostgresSaver` checkpointer for multi-turn resume + admin-approval workflows | ⏳ Deferred |
 
@@ -368,4 +372,4 @@ Tests for completed phases live in [`stress_tests/`](./stress_tests/); policy do
 ---
 
 ## Ownership & License
-Originally developed as a coursework project at Northeastern University (MLOps Group 9). This repository is owned and maintained by [Raghav Gali](https://github.com/Raghavgali), who is solely responsible for the production-readiness roadmap and all post-coursework engineering. License: **TBD**. Treat as all-rights-reserved until a formal license file is added.
+Originally developed as a coursework project at Northeastern University (MLOps Group 9). This repository is owned and maintained by [Raghav Gali](https://github.com/Raghavgali), who directs and is accountable for the production-readiness roadmap and all post-coursework engineering (architecture, integration, testing, review). AI coding tools assisted the implementation, as reflected by co-author trailers in the commit history. License: **TBD**. Treat as all-rights-reserved until a formal license file is added.
