@@ -151,6 +151,7 @@ class GenerationSettings:
     template_key: Optional[str] = None
     stream: bool = False
     streaming_overrides: Dict[str, Any] = field(default_factory=dict)
+    generation_backend: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GenerationSettings":
@@ -158,6 +159,7 @@ class GenerationSettings:
             template_key=data.get("template_key"),
             stream=bool(data.get("stream", False)),
             streaming_overrides=dict(data.get("streaming_overrides") or {}),
+            generation_backend=data.get("generation_backend"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -165,6 +167,7 @@ class GenerationSettings:
             "template_key": self.template_key,
             "stream": self.stream,
             "streaming_overrides": dict(self.streaming_overrides),
+            "generation_backend": self.generation_backend,
         }
 
 
@@ -256,6 +259,7 @@ class RAGPipeline:
         template_key: Optional[str] = None,
         stream: Optional[bool] = None,
         streaming_overrides: Optional[Dict[str, Any]] = None,
+        generation_backend: Optional[str] = None,
         max_documents: Optional[int] = None,
     ) -> PipelineResult:
         """Execute the configured RAG pipeline."""
@@ -287,6 +291,7 @@ class RAGPipeline:
             template_key is not None
             or stream is not None
             or streaming_overrides is not None
+            or generation_backend is not None
         ):
             runtime_overrides.setdefault("generation", {})
             if template_key is not None:
@@ -298,6 +303,8 @@ class RAGPipeline:
                     "streaming_overrides", {}
                 )
                 current.update(streaming_overrides)
+            if generation_backend is not None:
+                runtime_overrides["generation"]["generation_backend"] = generation_backend
 
         combined_overrides = _deep_merge(runtime_overrides, config_overrides or {})
         settings = self._resolve_settings(combined_overrides)
@@ -363,6 +370,7 @@ class RAGPipeline:
             template_key=settings.generation.template_key,
             stream=effective_stream,
             streaming_overrides=effective_stream_overrides,
+            generation_backend=settings.generation.generation_backend,
             max_documents=settings.retriever.max_documents,
             documents=docs,
             metadatas=metadata,
