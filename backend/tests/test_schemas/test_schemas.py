@@ -16,15 +16,19 @@ def test_login_request_invalid_email():
         LoginRequest(email="invalid-email", password="password123")
 
 def test_login_response_valid():
-    """Test valid login response"""
+    """Test valid login response (includes Phase 0.7 refresh-token fields)"""
     response = LoginResponse(
         access_token="token123",
+        refresh_token="refresh456",
         token_type="bearer",
+        expires_in=3600,
         email="user@example.com",
         role="user",
         company="Test Company"
     )
     assert response.access_token == "token123"
+    assert response.refresh_token == "refresh456"
+    assert response.expires_in == 3600
     assert response.role == "user"
 
 def test_rag_query_request_valid():

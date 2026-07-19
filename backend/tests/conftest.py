@@ -16,7 +16,6 @@ sys.path.insert(0, str(backend_path))
 sys.path.insert(0, str(backend_path.parent))
 
 from db.connection import Base, get_db
-from main import app
 
 # Test database URL (use in-memory SQLite for tests)
 TEST_DATABASE_URL = "sqlite://"
@@ -56,6 +55,10 @@ def test_db(test_engine):
 @pytest.fixture(scope="function")
 def client(test_engine):
     """Create a test client with test database"""
+    # Imported lazily so DB-only test modules don't pay for (or break on)
+    # the full app import chain (chat_pipeline, torch, etc.).
+    from main import app
+
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
     
     def override_get_db():
