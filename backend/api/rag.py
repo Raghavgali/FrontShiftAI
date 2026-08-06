@@ -2,12 +2,19 @@
 RAG query API endpoints
 """
 from fastapi import APIRouter, HTTPException, Depends
-from schemas import RAGQueryRequest, RAGQueryResponse
+from schemas import (
+    RAGQueryRequest,
+    RAGQueryResponse,
+    RAGPrefetchRequest,
+    RAGPrefetchResponse,
+)
 from services import normalize_metadata_company_name
 from api.auth import get_current_user
 from chat_pipeline.rag.pipeline import RAGPipeline
 from chat_pipeline.rag.generator import get_last_backend_used
 from sse_starlette import EventSourceResponse
+from starlette.concurrency import run_in_threadpool
+import asyncio
 import logging
 import time
 import json
@@ -63,6 +70,7 @@ async def rag_query(
             company_name=rag_company_filter,
             streaming_overrides=streaming_overrides,
             generation_backend=request.generation_backend,
+            template_key=request.template_key,
         )
         pipeline_duration = time.time() - pipeline_start
 
@@ -137,6 +145,97 @@ async def rag_query(
         )
         raise HTTPException(status_code=500, detail=str(e))
     
+PREFETCH_TIMEOUT_SECONDS = 5.0
+
+
+@router.post("/prefetch", response_model=RAGPrefetchResponse)
+async def rag_prefetch(
+    request: RAGPrefetchRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Retrieval-only warm-up (Phase 5B).
+
+    The voice agent calls this on partial STT transcripts so the documents are
+    already retrieved by the time the final transcript triggers the real turn.
+    It never generates, and it never fails the caller: a prefetch that errors
+    or times out simply reports cached=false, because the follow-up query will
+    do the retrieval itself anyway.
+    """
+    company_name = current_user.get("company")
+
+    if current_user["role"] != "super_admin" and not company_name:
+        raise HTTPException(
+            status_code=403,
+            detail="No company associated with this user",
+        )
+
+    rag_company_filter = (
+        company_name if current_user["role"] != "super_admin" else None
+    )
+
+    start_time = time.time()
+    result = {"cached": False, "cache_hit": False, "documents": 0,
+              "retrieval_duration_seconds": 0.0}
+    try:
+        # Off the event loop: retrieval is CPU/IO bound and synchronous, and a
+        # warm-up must never stall the real turn being served by this worker.
+        result = await asyncio.wait_for(
+            run_in_threadpool(
+                pipeline.prefetch,
+                request.query,
+                rag_company_filter,
+                top_k=request.top_k,
+            ),
+            timeout=PREFETCH_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "RAG prefetch timed out",
+            extra={
+                "user_email": current_user.get("email"),
+                "company": company_name,
+                "query": request.query,
+                "metric_type": "rag_prefetch_timeout",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - a warm-up must not surface errors
+        logger.warning(
+            "RAG prefetch failed",
+            extra={
+                "user_email": current_user.get("email"),
+                "company": company_name,
+                "query": request.query,
+                "error": str(exc),
+                "metric_type": "rag_prefetch_error",
+            },
+        )
+
+    logger.info(
+        "RAG prefetch completed",
+        extra={
+            "user_email": current_user.get("email"),
+            "company": company_name,
+            "query": request.query,
+            "top_k": request.top_k,
+            "cached": result.get("cached", False),
+            "documents": result.get("documents", 0),
+            "total_duration_seconds": time.time() - start_time,
+            "metric_type": "rag_prefetch",
+        },
+    )
+
+    return RAGPrefetchResponse(
+        query=request.query,
+        company=company_name or "All Companies",
+        cached=bool(result.get("cached", False)),
+        documents=int(result.get("documents", 0)),
+        retrieval_duration_seconds=float(
+            result.get("retrieval_duration_seconds", 0.0)
+        ),
+        cache_hit=bool(result.get("cache_hit", False)),
+    )
+
+
 @router.post("/query/stream")
 async def rag_query_stream(
     request: RAGQueryRequest,
@@ -179,6 +278,7 @@ async def rag_query_stream(
                     {"max_tokens": request.max_tokens} if request.max_tokens else None
                 ),
                 generation_backend=request.generation_backend,
+                template_key=request.template_key,
             )
         except Exception as exc:
             logger.error(

@@ -60,6 +60,33 @@ RERANKER_REGISTRY = {
 
 DEFAULT_CACHE_SIZE = 32
 
+# Phase 5B: the retrieval cache is what makes /api/rag/prefetch worth calling.
+# It is deliberately separate from the response cache above:
+#   * the response cache is keyed on the *full* config (including generation
+#     settings), so a prefetch could never populate a key that a later query
+#     would look up;
+#   * retrieval results are also reusable across generation settings, which is
+#     exactly the voice case (prefetch has no template_key/max_tokens, the real
+#     turn has both).
+# Entries expire so a re-indexed corpus cannot be served from a warm entry for
+# the rest of the process lifetime.
+DEFAULT_RETRIEVAL_CACHE_SIZE = 64
+DEFAULT_RETRIEVAL_CACHE_TTL_SECONDS = 300.0
+
+_TRAILING_PUNCTUATION = ".,!?;:'\"-"
+
+
+def normalize_retrieval_query(query: str) -> str:
+    """Collapse a query to the form used as the retrieval cache key.
+
+    Partial STT transcripts differ from the final transcript mostly in casing,
+    whitespace and trailing punctuation ("whats the pto policy" vs "What's the
+    PTO policy?"), so normalizing here is what lets a prefetch fired on a
+    partial be reused by the real turn.
+    """
+
+    return " ".join((query or "").lower().split()).strip(_TRAILING_PUNCTUATION).strip()
+
 
 def _deep_merge(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Recursively merge dictionaries without mutating the originals."""
@@ -216,6 +243,8 @@ class RAGPipeline:
         config_overrides: Optional[Dict[str, Any]] = None,
         *,
         cache_size: int = DEFAULT_CACHE_SIZE,
+        retrieval_cache_size: int = DEFAULT_RETRIEVAL_CACHE_SIZE,
+        retrieval_cache_ttl: float = DEFAULT_RETRIEVAL_CACHE_TTL_SECONDS,
     ):
         self.retriever_registry = dict(RETRIEVER_REGISTRY)
         self.reranker_registry = dict(RERANKER_REGISTRY)
@@ -224,6 +253,11 @@ class RAGPipeline:
         self.cache_size = max(int(cache_size), 0)
         self._cache: OrderedDict[str, Tuple[str, List[Dict[str, Any]]]] = OrderedDict()
         self._cache_lock = threading.Lock()
+        # Phase 5B retrieval cache: key -> (stored_at, docs, metadata)
+        self.retrieval_cache_size = max(int(retrieval_cache_size), 0)
+        self.retrieval_cache_ttl = max(float(retrieval_cache_ttl), 0.0)
+        self._retrieval_cache: "OrderedDict[str, Tuple[float, List[str], List[Dict[str, Any]]]]" = OrderedDict()
+        self._retrieval_cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Component registration helpers
@@ -341,7 +375,16 @@ class RAGPipeline:
 
         start = time.perf_counter()
         self._validate_components(settings)
-        docs, metadata = self._execute_retrieval(query, company_name, settings)
+        # Phase 5B: a prefetch fired on a partial STT transcript may already
+        # have warmed this exact retrieval; reuse it instead of re-embedding.
+        warmed = self._retrieval_cache_get(query, company_name, settings)
+        if warmed is not None:
+            docs, metadata = warmed
+            timings["retrieval_cache_hit"] = 1.0
+        else:
+            docs, metadata = self._execute_retrieval(query, company_name, settings)
+            self._retrieval_cache_put(query, company_name, settings, docs, metadata)
+            timings["retrieval_cache_hit"] = 0.0
         retrieval_duration = time.perf_counter() - start
         timings["retrieval"] = retrieval_duration
         _emit_rag_metric("observe_rag_retrieval", company_name, retrieval_duration)
@@ -396,9 +439,127 @@ class RAGPipeline:
             generation_backend=backend_used,
         )
 
+    def prefetch(
+        self,
+        query: str,
+        company_name: Optional[str] = None,
+        *,
+        top_k: Optional[int] = None,
+        retriever: Optional[str] = None,
+        max_documents: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Run retrieval only and warm the retrieval cache (Phase 5B).
+
+        Returns a small summary dict. Never generates, so it costs one
+        embedding + one vector search and nothing else. A later :meth:`run`
+        for the same normalized query, company and retriever settings skips
+        retrieval and goes straight to generation.
+        """
+
+        runtime_overrides: Dict[str, Any] = {}
+        if retriever is not None or top_k is not None or max_documents is not None:
+            runtime_overrides["retriever"] = {}
+            if retriever is not None:
+                runtime_overrides["retriever"]["name"] = retriever
+            if top_k is not None:
+                runtime_overrides["retriever"]["top_k"] = top_k
+            if max_documents is not None:
+                runtime_overrides["retriever"]["max_documents"] = max_documents
+
+        settings = self._resolve_settings(runtime_overrides)
+        self._validate_components(settings)
+
+        start = time.perf_counter()
+        warmed = self._retrieval_cache_get(query, company_name, settings)
+        if warmed is not None:
+            docs, _metadata = warmed
+            return {
+                "cached": True,
+                "cache_hit": True,
+                "documents": len(docs),
+                "retrieval_duration_seconds": time.perf_counter() - start,
+            }
+
+        docs, metadata = self._execute_retrieval(query, company_name, settings)
+        duration = time.perf_counter() - start
+        _emit_rag_metric("observe_rag_retrieval", company_name, duration)
+        cached = False
+        if docs:
+            self._retrieval_cache_put(query, company_name, settings, docs, metadata)
+            cached = True
+        return {
+            "cached": cached,
+            "cache_hit": False,
+            "documents": len(docs),
+            "retrieval_duration_seconds": duration,
+        }
+
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
+    def _retrieval_cache_key(
+        self,
+        query: str,
+        company_name: Optional[str],
+        settings: PipelineConfig,
+    ) -> str:
+        """Key on the normalized query + tenant + everything that changes docs.
+
+        Generation settings are excluded on purpose: the same retrieval feeds
+        a voice turn (short template, 256 tokens) and a chat turn. The tenant
+        is part of the key, so a warm entry can never cross companies.
+        """
+
+        payload = {
+            "query": normalize_retrieval_query(query),
+            "company_name": (company_name or "").strip().lower() or None,
+            "retriever": settings.retriever.to_dict(),
+            "reranker": settings.reranker.to_dict(),
+        }
+        return json.dumps(payload, sort_keys=True)
+
+    def _retrieval_cache_get(
+        self,
+        query: str,
+        company_name: Optional[str],
+        settings: PipelineConfig,
+    ) -> Optional[Tuple[List[str], List[Dict[str, Any]]]]:
+        if self.retrieval_cache_size <= 0:
+            return None
+        key = self._retrieval_cache_key(query, company_name, settings)
+        now = time.monotonic()
+        with self._retrieval_cache_lock:
+            entry = self._retrieval_cache.get(key)
+            if entry is None:
+                return None
+            stored_at, docs, metadata = entry
+            if self.retrieval_cache_ttl and now - stored_at > self.retrieval_cache_ttl:
+                self._retrieval_cache.pop(key, None)
+                return None
+            self._retrieval_cache.move_to_end(key)
+            return list(docs), copy.deepcopy(metadata)
+
+    def _retrieval_cache_put(
+        self,
+        query: str,
+        company_name: Optional[str],
+        settings: PipelineConfig,
+        docs: List[str],
+        metadata: List[Dict[str, Any]],
+    ) -> None:
+        if self.retrieval_cache_size <= 0 or not docs:
+            return
+        key = self._retrieval_cache_key(query, company_name, settings)
+        with self._retrieval_cache_lock:
+            self._retrieval_cache[key] = (
+                time.monotonic(),
+                list(docs),
+                copy.deepcopy(metadata),
+            )
+            self._retrieval_cache.move_to_end(key)
+            while len(self._retrieval_cache) > self.retrieval_cache_size:
+                self._retrieval_cache.popitem(last=False)
+
     def _resolve_settings(self, overrides: Optional[Dict[str, Any]]) -> PipelineConfig:
         config_dict = _deep_merge(self._base_config, overrides or {})
         return PipelineConfig.from_dict(config_dict)
@@ -635,4 +796,10 @@ if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
     main()
 
 
-__all__ = ["RAGPipeline", "PipelineConfig", "PipelineResult", "load_pipeline_config"]
+__all__ = [
+    "RAGPipeline",
+    "PipelineConfig",
+    "PipelineResult",
+    "load_pipeline_config",
+    "normalize_retrieval_query",
+]

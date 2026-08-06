@@ -6,11 +6,17 @@ from schemas.auth import (
     CreateUserRequest, UpdatePasswordRequest, DeleteUserRequest, BulkCreateUserRequest,
     RefreshRequest, RefreshResponse, LogoutRequest,
 )
-from schemas.rag import RAGQueryRequest, RAGQueryResponse
+from schemas.rag import (
+    RAGQueryRequest,
+    RAGQueryResponse,
+    RAGPrefetchRequest,
+    RAGPrefetchResponse,
+)
 
 __all__ = [
     "LoginRequest", "LoginResponse", "UserInfo",
     "CreateUserRequest", "UpdatePasswordRequest", "DeleteUserRequest", "BulkCreateUserRequest",
     "RefreshRequest", "RefreshResponse", "LogoutRequest",
     "RAGQueryRequest", "RAGQueryResponse",
+    "RAGPrefetchRequest", "RAGPrefetchResponse",
 ]
