@@ -6,14 +6,18 @@ LangChain :class`~langchain.schema.Document` objects that power lexical
 retrievers such as BM25.
 """
 from __future__ import annotations
+import copy
 import json
 import logging
 import os
 import subprocess
 import tarfile
+import threading
+import time
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 import chromadb
 from chromadb.api.models.Collection import Collection
 from chromadb.utils import embedding_functions
@@ -41,6 +45,88 @@ def _to_optional_int(value: Optional[str]) -> Optional[int]:
         return int(value) if value not in (None, "") else None
     except (TypeError, ValueError):
         return None
+
+class _BoundedCache:
+    """Tiny thread-safe LRU cache for string-keyed lookups.
+
+    Two properties matter here:
+
+    * **Bounded.** ``resolve_company_filter`` is keyed by a company name that
+      arrives from a request payload, so an unbounded dict would let arbitrary
+      input grow the process heap forever.
+    * **Lock guarded.** The RAG pipeline is served from a thread pool, so the
+      same lock-guarded ``OrderedDict`` idiom as ``RAGPipeline._cache`` is used
+      instead of a bare dict.
+    """
+
+    __slots__ = ("_maxsize", "_data", "_lock")
+
+    def __init__(self, maxsize: int) -> None:
+        self._maxsize = max(int(maxsize), 1)
+        self._data: "OrderedDict[str, Any]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            if key not in self._data:
+                return None
+            self._data.move_to_end(key)
+            return self._data[key]
+
+    def put(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._data[key] = value
+            self._data.move_to_end(key)
+            while len(self._data) > self._maxsize:
+                evicted, _ = self._data.popitem(last=False)
+                logger.debug("Evicted cache entry %r (maxsize=%d)", evicted, self._maxsize)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._data)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+    def __contains__(self, key: object) -> bool:
+        with self._lock:
+            return key in self._data
+
+
+# Company names come from user input, so this cache is deliberately small.
+COMPANY_FILTER_CACHE_MAXSIZE = 128
+_COMPANY_FILTER_CACHE = _BoundedCache(COMPANY_FILTER_CACHE_MAXSIZE)
+
+# Keyed by collection name, which is configuration derived, so a handful of
+# slots is plenty. Bounded anyway so nothing here can grow without limit.
+_ALL_COMPANIES_CACHE = _BoundedCache(8)
+
+
+def _cache_company_filter(
+        normalized: str,
+        resolved_filter: Dict[str, Dict],
+) -> Dict[str, Dict]:
+    """Store a resolved filter under ``normalized`` and return it.
+
+    A deep copy is cached so a caller that mutates the returned ``where``
+    clause cannot corrupt the entry every later request reads.
+    """
+    _COMPANY_FILTER_CACHE.put(normalized, copy.deepcopy(resolved_filter))
+    return resolved_filter
+
+
+def clear_company_caches() -> None:
+    """Drop the company filter and company list caches.
+
+    Call after re-syncing or rebuilding the vector store, and from tests.
+    """
+    _COMPANY_FILTER_CACHE.clear()
+    _ALL_COMPANIES_CACHE.clear()
 
 CHROMA_DIR = _resolve_path(
     os.getenv("CHROMA_DIR") or VECTOR_CONFIG.get("local_path"),
@@ -116,6 +202,121 @@ class CompanyCorpus(NamedTuple):
     documents: List[Document]
     filter_kwargs: Dict[str, Dict]
 
+# Mirrors the ``gcs_sync`` policy in docs/resilience_policy.md (300s timeout,
+# 3 retries, exponential 5s base). It is restated here rather than imported
+# from ``backend.utils.resilience`` because chat_pipeline must stay importable
+# without the backend package on sys.path.
+GCS_SYNC_MAX_RETRIES = 3                          # retries after the first attempt
+GCS_SYNC_BACKOFF_SECONDS = (5.0, 10.0, 20.0)      # sleep before retry 1, 2, 3
+GCS_SYNC_TIMEOUT_SECONDS = 300.0
+
+
+class ChromaSyncError(RuntimeError):
+    """Raised when the remote Chroma archive cannot be fetched or trusted."""
+
+
+def _verify_chroma_archive(tar_path: Path) -> None:
+    """Raise ``ChromaSyncError`` unless ``tar_path`` is a readable, non-empty tar.
+
+    ``gsutil cp`` can leave behind a truncated object when the transfer dies
+    mid-stream, and a truncated gzip stream only fails later during extraction.
+    Checking size and readability up front keeps a bad artifact from being
+    treated as a successful sync.
+    """
+    if not tar_path.exists():
+        raise ChromaSyncError(f"Download reported success but {tar_path} is missing.")
+    size = tar_path.stat().st_size
+    if size <= 0:
+        raise ChromaSyncError(f"Downloaded archive {tar_path} is empty (0 bytes).")
+    try:
+        with tarfile.open(tar_path, "r:gz") as tar:
+            if tar.next() is None:
+                raise ChromaSyncError(
+                    f"Downloaded archive {tar_path} contains no members."
+                )
+    # A truncated gzip stream surfaces as EOFError, and a corrupt one as
+    # gzip.BadGzipFile (an OSError), neither of which is a TarError.
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise ChromaSyncError(
+            f"Downloaded archive {tar_path} ({size} bytes) is not a readable tar.gz: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    logger.info("Verified Chroma archive %s (%d bytes).", tar_path, size)
+
+
+def _fetch_chroma_archive(remote_uri: str, tar_path: Path) -> None:
+    """Single ``gsutil cp`` attempt followed by an integrity check.
+
+    Raises ``FileNotFoundError`` when gsutil itself is missing (not retryable)
+    and ``ChromaSyncError`` for anything transient.
+    """
+    if tar_path.exists():
+        # A partial file from a previous attempt must never be reused.
+        tar_path.unlink()
+    try:
+        subprocess.run(
+            ["gsutil", "cp", remote_uri, str(tar_path)],
+            check=True,
+            capture_output=True,
+            timeout=GCS_SYNC_TIMEOUT_SECONDS,
+        )
+    except subprocess.CalledProcessError as exc:
+        error_msg = exc.stderr.decode().strip() if exc.stderr else str(exc)
+        raise ChromaSyncError(
+            f"Failed to download Chroma store from {remote_uri}: {error_msg}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ChromaSyncError(
+            f"Download of {remote_uri} exceeded {GCS_SYNC_TIMEOUT_SECONDS}s."
+        ) from exc
+    _verify_chroma_archive(tar_path)
+
+
+def _download_chroma_archive(remote_uri: str, tar_path: Path) -> None:
+    """Download the archive with bounded retries and exponential backoff.
+
+    Partial downloads are removed between attempts so a truncated file can
+    never be mistaken for a complete one.
+    """
+    last_error: Optional[BaseException] = None
+    for attempt in range(GCS_SYNC_MAX_RETRIES + 1):
+        try:
+            logger.info(
+                "Downloading ChromaDB archive to %s (attempt %d/%d)",
+                tar_path,
+                attempt + 1,
+                GCS_SYNC_MAX_RETRIES + 1,
+            )
+            _fetch_chroma_archive(remote_uri, tar_path)
+            return
+        except FileNotFoundError as exc:
+            # gsutil is not installed. Retrying cannot help.
+            raise RuntimeError(
+                "gsutil is required to download the remote Chroma store."
+            ) from exc
+        except ChromaSyncError as exc:
+            last_error = exc
+            if tar_path.exists():
+                tar_path.unlink()
+            if attempt >= GCS_SYNC_MAX_RETRIES:
+                break
+            delay = GCS_SYNC_BACKOFF_SECONDS[
+                min(attempt, len(GCS_SYNC_BACKOFF_SECONDS) - 1)
+            ]
+            logger.warning(
+                "Chroma sync attempt %d failed (%s). Retrying in %.0fs.",
+                attempt + 1,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"Chroma sync from {remote_uri} failed after "
+        f"{GCS_SYNC_MAX_RETRIES + 1} attempts: {last_error}"
+    ) from last_error
+
+
 def ensure_chroma_store(chroma_dir: Path = CHROMA_DIR, remote_uri: Optional[str] = CHROMA_REMOTE_URI) -> Path:
     """Ensure the Chroma vector store is available locally.
     Parameters
@@ -158,30 +359,16 @@ def ensure_chroma_store(chroma_dir: Path = CHROMA_DIR, remote_uri: Optional[str]
     tar_path = chroma_dir.parent / "chroma_db.tar.gz"
     
     try:
-        logger.info(f"Downloading ChromaDB archive to: {tar_path}")
-        subprocess.run(
-            ["gsutil", "cp", remote_uri, str(tar_path)],
-            check=True,
-            capture_output=True,
-        )
+        # Retries + integrity verification live in _download_chroma_archive.
+        _download_chroma_archive(remote_uri, tar_path)
+
         logger.info("Download complete. Extracting archive...")
-        
-        # Extract tar.gz
         with tarfile.open(tar_path, "r:gz") as tar:
-            tar.extractall(path=chroma_dir.parent)
-        
+            # filter="data" rejects absolute paths and links that escape the
+            # destination, so a tampered archive cannot write outside it.
+            tar.extractall(path=chroma_dir.parent, filter="data")
+
         logger.info(f"ChromaDB store extracted to: {chroma_dir}")
-        
-        # Clean up tar file
-        tar_path.unlink()
-        
-    except FileNotFoundError as exc:
-        raise RuntimeError("gsutil is required to download the remote Chroma store.") from exc
-    except subprocess.CalledProcessError as exc:
-        error_msg = exc.stderr.decode().strip() if exc.stderr else str(exc)
-        raise RuntimeError(
-            f"Failed to download Chroma store from {remote_uri}: {error_msg}"
-        ) from exc
     except tarfile.TarError as exc:
         raise RuntimeError(f"Failed to extract Chroma store archive: {exc}") from exc
     finally:
@@ -226,20 +413,38 @@ def get_collection() -> Collection:
         ) from exc
 
 def _get_all_companies(collection: Collection) -> List[str]:
-    """Fetch all unique company names from the vector store."""
+    """Fetch all unique company names from the vector store.
+
+    Cached per collection name. ``functools.lru_cache`` cannot be used here:
+    ``chromadb.api.models.Collection.Collection`` defines ``__eq__`` without
+    ``__hash__``, so ``Collection.__hash__`` is ``None`` and every call would
+    raise ``TypeError: unhashable type: 'Collection'``. An lru_cache would also
+    pin the Collection (and its client) alive for the process lifetime.
+
+    Failures are not cached, so a transient Chroma error cannot poison the
+    cache with an empty list forever.
+    """
+    cache_key = str(getattr(collection, "name", "") or "<unnamed>")
+    cached = _ALL_COMPANIES_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
     try:
         # Fetch a large sample of metadata to find unique companies
         # Note: Chroma doesn't have a "SELECT DISTINCT" so we peek/scan
-        peek = collection.get(include=["metadatas"], limit=10000) 
+        peek = collection.get(include=["metadatas"], limit=10000)
         metadatas = peek.get("metadatas", [])
         companies = set()
         for m in metadatas:
-            if m and "company" in m:
+            if m and isinstance(m.get("company"), str) and m["company"]:
                 companies.add(m["company"])
-        return list(companies)
     except Exception as e:
         logger.error(f"Failed to fetch companies: {e}")
         return []
+
+    resolved = sorted(companies)
+    _ALL_COMPANIES_CACHE.put(cache_key, resolved)
+    return list(resolved)
 
 def resolve_company_filter(collection: Collection, company_name: Optional[str]) -> Dict[str, Dict]:
     """Build a case-insensitive ``where`` clause for the requested company."""
@@ -249,14 +454,23 @@ def resolve_company_filter(collection: Collection, company_name: Optional[str]) 
     if not normalized:
         return {}
 
+    cached_filter = _COMPANY_FILTER_CACHE.get(normalized)
+    if cached_filter is not None:
+        return copy.deepcopy(cached_filter)
+
     index = _load_company_index()
     if index:
         if normalized in index:
-            return {"where": {"company": index[normalized]}}
+            return _cache_company_filter(
+                normalized,
+                {"where": {"company": index[normalized]}},
+            )
         for key, canonical in index.items():
             if normalized in key:
-                return {"where": {"company": canonical}}
-
+                return _cache_company_filter(
+                    normalized,
+                    {"where": {"company": canonical}},
+                )
     try:
         peek = collection.peek(limit=200)
         matches = [
@@ -265,24 +479,32 @@ def resolve_company_filter(collection: Collection, company_name: Optional[str]) 
             if normalized in _normalize_company(meta.get("company"))
         ]
         if matches:
-            return {"where": {"company": matches[0]}}
+            return _cache_company_filter(
+                normalized,
+                {"where": {"company": matches[0]}},
+            )
     except Exception as exc:  # pragma: no cover - best effort fallback
         logger.debug("Unable to identify company filter via peek(): %s", exc)
 
     # Fallback: Dynamic Lookup (Replaces hardcoded list)
     known_companies = _get_all_companies(collection)
-    if normalized:
-        # Try to find a known company that contains the search term
-        for known in known_companies:
-            if normalized in known.lower():
-                logger.info(f"Mapped '{company_name}' to known company '{known}'")
-                return {"where": {"company": known}}
-    
-        # If no match found in dynamic list, try raw contains
-        logger.warning(f"Company '{company_name}' not found in dynamic list. Using raw contains.")
-        return {"where": {"company": {"$contains": normalized}}} 
+    for known in known_companies:
+        if normalized in known.lower():
+            logger.info("Mapped '%s' to known company '%s'", company_name, known)
+            return _cache_company_filter(
+                normalized,
+                {"where": {"company": known}},
+            )
 
-    return {}
+    # If no match found in dynamic list, try raw contains
+    logger.warning(
+        "Company '%s' not found in dynamic list. Using raw contains.",
+        company_name,
+    )
+    return _cache_company_filter(
+        normalized,
+        {"where": {"company": {"$contains": normalized}}},
+    )
 
 def _collection_documents(
     collection: Collection,
@@ -339,8 +561,11 @@ def load_data_company(
     return CompanyCorpus(collection=collection, documents=documents, filter_kwargs=filter_kwargs)
 
 __all__ = [
+    "ChromaSyncError",
     "CompanyCorpus",
+    "clear_company_caches",
     "load_data_company",
     "get_collection",
     "ensure_chroma_store",
+    "resolve_company_filter",
 ]

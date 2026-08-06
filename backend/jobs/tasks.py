@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from .worker import celery_app
 from db import SessionLocal
 from db.models import Task, Company, IdempotencyRecord
+from utils.resilience import get_policy, resilient
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,55 @@ URL_JSON_PATH = DATA_PIPELINE_DIR / "data" / "url.json"
 PIPELINE_SCRIPT = DATA_PIPELINE_DIR / "scripts" / "pipeline_runner.py"
 DATA_DIR = DATA_PIPELINE_DIR / "data"
 GCS_BUCKET = "gs://frontshiftai-data"
+
+# Timeout/retry/backoff for the bucket sync come from the shared policy matrix
+# (docs/resilience_policy.md): 300s timeout, 3 retries, exponential 5s base,
+# so 5s/10s/20s between attempts.
+_GCS_SYNC_POLICY = get_policy("gcs_sync")
+
+
+class GCSSyncError(RuntimeError):
+    """Raised when the data directory cannot be pushed to the bucket."""
+
+
+@resilient(policy="gcs_sync")
+def sync_data_dir_to_gcs(data_dir: Path, bucket: str, env: dict) -> None:
+    """Push ``data_dir`` to ``bucket`` with retries and a pre-flight check.
+
+    A single network blip used to fail the whole ingestion task. The retry
+    budget comes from the ``gcs_sync`` policy. The pre-flight check refuses to
+    sync a missing or empty data directory, so a pipeline that produced nothing
+    cannot be mistaken for a successful sync.
+    """
+    if not data_dir.exists() or not any(data_dir.iterdir()):
+        # Not retryable in any useful sense, but raising here still surfaces
+        # the real problem instead of silently reporting success.
+        raise GCSSyncError(
+            f"Refusing to sync {data_dir}: directory is missing or empty."
+        )
+
+    try:
+        result = subprocess.run(
+            ["gsutil", "-m", "rsync", "-r", str(data_dir), bucket],
+            capture_output=True,
+            text=True,
+            timeout=_GCS_SYNC_POLICY.timeout_s,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Re-wrapped so the caller does not confuse this with the pipeline
+        # subprocess timing out.
+        raise GCSSyncError(
+            f"GCS sync exceeded {_GCS_SYNC_POLICY.timeout_s}s."
+        ) from exc
+    except FileNotFoundError as exc:
+        raise GCSSyncError("gsutil is required to sync data to GCS.") from exc
+
+    if result.returncode != 0:
+        raise GCSSyncError(f"GCS sync failed: {(result.stderr or '').strip()}")
+
+    logger.info("Synced %s to %s", data_dir, bucket)
+
 
 @celery_app.task(bind=True)
 def process_company_pipeline_task(self, task_id: str, company_name: str, domain: str, url: str):
@@ -90,17 +140,8 @@ def process_company_pipeline_task(self, task_id: str, company_name: str, domain:
         task.message = "Syncing to Google Cloud Storage..."
         db.commit()
         
-        sync_result = subprocess.run(
-            ["gsutil", "-m", "rsync", "-r", str(DATA_DIR), GCS_BUCKET],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=env
-        )
-        
-        if sync_result.returncode != 0:
-            raise Exception(f"GCS sync failed: {sync_result.stderr}")
-        
+        sync_data_dir_to_gcs(DATA_DIR, GCS_BUCKET, env)
+
         # Success
         task.status = "completed"
         task.message = "Company added successfully!"
@@ -204,17 +245,8 @@ def process_delete_company_task(self, task_id: str, company_name: str):
         task.message = "Syncing changes to Google Cloud Storage..."
         db.commit()
         
-        sync_result = subprocess.run(
-            ["gsutil", "-m", "rsync", "-r", str(DATA_DIR), GCS_BUCKET],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=env
-        )
-        
-        if sync_result.returncode != 0:
-            raise Exception(f"GCS sync failed: {sync_result.stderr}")
-            
+        sync_data_dir_to_gcs(DATA_DIR, GCS_BUCKET, env)
+    
         task.status = "completed"
         task.message = "Company deleted and index rebuilt successfully!"
         task.completed_at = datetime.now(timezone.utc)
