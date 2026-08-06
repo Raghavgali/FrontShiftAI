@@ -36,12 +36,22 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # Only gate on CI conclusion for the chained workflow_run event. For push
-    # and workflow_dispatch there is no workflow_run payload, and gating on it
-    # unconditionally would skip the job every time.
+    # Two gates.
+    #
+    # DEPLOY_BACKEND_ENABLED is a repo variable acting as an on switch. Until
+    # the GCP project, Workload Identity and Secret Manager entries exist, a
+    # deploy can only fail, and a failing run on every push to main is just
+    # notification noise. Set the variable to 'true' once the infrastructure
+    # is in place. A secret cannot be used here because the secrets context
+    # is not available in a job-level if.
+    #
+    # The workflow_run conclusion is only meaningful for the chained event.
+    # For push and workflow_dispatch there is no workflow_run payload, and
+    # gating on it unconditionally would skip the job every time.
     if: >-
-      github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion == 'success'
+      vars.DEPLOY_BACKEND_ENABLED == 'true' &&
+      (github.event_name != 'workflow_run' ||
+       github.event.workflow_run.conclusion == 'success')
 
     permissions:
       contents: read
