@@ -6,16 +6,26 @@ out on the response. Correlation IDs are the bridge between dashboards
 ("p95 just spiked at 14:22") and logs ("what exactly happened to this
 slow request?").
 
-Logs pick up the ID automatically by instantiating the
-:class:`RequestIdLogFilter` on any logger — the filter reads the
-ContextVar at emit time, so there's no need to thread the ID through
-your function signatures.
+Logs pick up the ID automatically: :func:`install_log_filter` installs a
+``logging`` record factory that stamps ``request_id`` on every record from
+the ContextVar, so there is no need to thread the ID through function
+signatures.
+
+Phase 6A note: the original implementation attached
+:class:`RequestIdLogFilter` to the root logger only. Logger-level filters
+run in ``Logger.handle`` on the logger the record *originated* from, and
+propagation to ancestors only walks *handlers*, so a root filter never saw
+records from module loggers like ``logging.getLogger(__name__)``. Any
+formatter referencing ``%(request_id)s`` would then raise
+"Formatting field not found in record". A record factory is topology
+independent and covers every logger, including third-party ones.
 """
 from __future__ import annotations
 
 import logging
 import uuid
 from contextvars import ContextVar
+from threading import Lock
 from typing import Awaitable, Callable, Optional
 
 from fastapi import Request, Response
@@ -25,6 +35,17 @@ _current_request_id: ContextVar[Optional[str]] = ContextVar(
 )
 
 _HEADER = "X-Request-ID"
+
+# Public aliases. The voice worker imports the same names (see
+# voice_pipeline/utils/correlation.py) so the header spelling lives in one
+# place on both sides of the hop.
+CORRELATION_HEADER = _HEADER
+
+# Fallback source: the voice worker labels a conversation with a LiveKit
+# session id. If it sends that instead of a request id, use it verbatim so a
+# single grep spans the voice logs and every backend tool call the session
+# made.
+SESSION_HEADER = "X-Session-ID"
 
 
 def get_request_id() -> Optional[str]:
@@ -44,8 +65,8 @@ def new_request_id() -> str:
 class RequestIdLogFilter(logging.Filter):
     """Attach ``request_id`` to every ``LogRecord`` from the ContextVar.
 
-    Install once at app startup so log formatters can reference
-    ``%(request_id)s`` without callers having to pass it around.
+    Kept for call sites that want per-logger or per-handler filtering. The
+    global guarantee comes from :func:`install_record_factory`.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
@@ -53,14 +74,48 @@ class RequestIdLogFilter(logging.Filter):
         return True
 
 
-def install_log_filter(logger: Optional[logging.Logger] = None) -> None:
-    """Attach the filter to the given logger (default: root)."""
-    target = logger if logger is not None else logging.getLogger()
-    # Avoid stacking duplicate filters on hot reloads.
-    for existing in target.filters:
-        if isinstance(existing, RequestIdLogFilter):
+_RECORD_FACTORY_INSTALLED = False
+_FACTORY_LOCK = Lock()
+
+
+def install_record_factory() -> None:
+    """Stamp ``request_id`` on every LogRecord created anywhere in-process.
+
+    Idempotent: wrapping the factory twice would still work but would add a
+    pointless call per record, and a hot reload would nest wrappers without
+    bound.
+    """
+    global _RECORD_FACTORY_INSTALLED
+    with _FACTORY_LOCK:
+        if _RECORD_FACTORY_INSTALLED:
             return
-    target.addFilter(RequestIdLogFilter())
+        previous = logging.getLogRecordFactory()
+
+        def factory(*args: object, **kwargs: object) -> logging.LogRecord:
+            record = previous(*args, **kwargs)  # type: ignore[arg-type]
+            record.request_id = _current_request_id.get() or "-"
+            return record
+
+        logging.setLogRecordFactory(factory)
+        _RECORD_FACTORY_INSTALLED = True
+
+
+def install_log_filter(logger: Optional[logging.Logger] = None) -> None:
+    """Make ``request_id`` available to every formatter in the process.
+
+    Installs the record factory (the part that actually works globally) and
+    also attaches the filter to the target logger and its handlers, which
+    keeps behaviour sane for anyone who inspects ``logger.filters`` or
+    installs handler-level formatters later.
+    """
+    install_record_factory()
+
+    target = logger if logger is not None else logging.getLogger()
+    if not any(isinstance(f, RequestIdLogFilter) for f in target.filters):
+        target.addFilter(RequestIdLogFilter())
+    for handler in target.handlers:
+        if not any(isinstance(f, RequestIdLogFilter) for f in handler.filters):
+            handler.addFilter(RequestIdLogFilter())
 
 
 async def request_id_middleware(
@@ -70,10 +125,17 @@ async def request_id_middleware(
 
     Trusts short, sanely-shaped client-supplied IDs (up to 128 chars of
     ``[A-Za-z0-9_.:-]``) so upstream gateways that already set one stay
-    coherent; otherwise generates a fresh UUID4-hex.
+    coherent; otherwise falls back to ``X-Session-ID`` (voice worker) and
+    finally generates a fresh UUID4-hex.
+
+    Header lookups go through ``request.headers``, which is already
+    case-insensitive, so no manual lower-casing is needed.
     """
-    incoming = request.headers.get(_HEADER) or request.headers.get(_HEADER.lower())
-    rid = _coerce_id(incoming) or new_request_id()
+    rid = (
+        _coerce_id(request.headers.get(_HEADER))
+        or _coerce_id(request.headers.get(SESSION_HEADER))
+        or new_request_id()
+    )
 
     token = _current_request_id.set(rid)
     try:

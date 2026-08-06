@@ -103,7 +103,9 @@ circuit_breaker_state = Gauge(
 )
 
 # ---------------------------------------------------------------------------
-# DB pool (populated lazily when QueuePool lands in Phase 6C)
+# DB pool (Phase 6C). Refreshed at scrape time by
+# ``_refresh_db_pool_gauges`` rather than on every request: pool depth is a
+# sampled quantity, and the scrape is exactly the sampling moment.
 # ---------------------------------------------------------------------------
 
 db_pool_size = Gauge(
@@ -230,8 +232,27 @@ def _current_company_label() -> str:
     return value
 
 
+def _refresh_db_pool_gauges() -> None:
+    """Sample the SQLAlchemy pool into the gauges (best effort).
+
+    Local import keeps ``observability.metrics`` importable without the DB
+    layer (the resilience unit tests do exactly that), and a pool class with
+    no queue (SQLite dev/test) simply leaves the gauges untouched.
+    """
+    try:
+        from db.connection import pool_stats
+        stats = pool_stats()
+    except Exception:  # noqa: BLE001 - metrics must never break a scrape
+        return
+    if "size" in stats:
+        db_pool_size.set(stats["size"])
+    if "checkedout" in stats:
+        db_pool_checkedout.set(stats["checkedout"])
+
+
 def metrics_endpoint() -> FastAPIResponse:
     """Serve the Prometheus scrape payload."""
+    _refresh_db_pool_gauges()
     return FastAPIResponse(
         content=generate_latest(),
         media_type=CONTENT_TYPE_LATEST,
