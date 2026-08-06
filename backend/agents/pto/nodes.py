@@ -24,6 +24,16 @@ from agents.utils.llm_client import get_llm_client
 logger = logging.getLogger(__name__)
 
 
+def _balance_year(state: PTOAgentState) -> int:
+    """Calendar year a request's balance belongs to.
+
+    Falls back to the current year when the dates have not been parsed yet,
+    which is what happens if the balance check runs before validation.
+    """
+    start_date = state.get("start_date")
+    return start_date.year if start_date else date.today().year
+
+
 def parse_intent_node(state: PTOAgentState, db: Session) -> PTOAgentState:
     """
     Node 1: Parse user message and extract intent
@@ -124,8 +134,11 @@ def check_balance_node(state: PTOAgentState, db: Session) -> PTOAgentState:
     logger.info("Checking PTO balance")
     
     email = state["user_email"]
-    year = 2025  # Current year
-    
+    # Balances are tracked per calendar year. Derive the year from the
+    # requested dates rather than hardcoding it, so the agent keeps working
+    # once the calendar rolls over.
+    year = _balance_year(state)
+
     balance = get_pto_balance(db, email, year)
     
     if not balance:
@@ -212,7 +225,7 @@ def create_request_node(state: PTOAgentState, db: Session) -> PTOAgentState:
     # Update pending days in balance
     balance = db.query(PTOBalance).filter(
         PTOBalance.email == state["user_email"],
-        PTOBalance.year == 2025
+        PTOBalance.year == _balance_year(state)
     ).first()
     
     if balance:
