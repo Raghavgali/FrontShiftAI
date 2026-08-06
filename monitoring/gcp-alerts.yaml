@@ -34,7 +34,22 @@ conditions:
           crossSeriesReducer: REDUCE_PERCENTILE_95
 
 notificationChannels:
-  - projects/frontshiftai/notificationChannels/4024549182504711839
+  # Placeholder. The previous value pointed at a notification channel in the
+  # old university group's GCP project and is not reachable any more.
+  #
+  # Substitute both parts below with values from your own project:
+  #   PROJECT_ID           your GCP project id (same one the backend deploys to)
+  #   NOTIFICATION_CHANNEL the numeric channel id
+  #
+  # Create a channel and list the ids with:
+  #   gcloud beta monitoring channels create \
+  #     --display-name="FrontShiftAI alerts" \
+  #     --type=email \
+  #     --channel-labels=email_address=YOU@example.com
+  #   gcloud beta monitoring channels list --format='value(name)'
+  #
+  # Leaving this placeholder in place means alerts fire but notify nobody.
+  - projects/PROJECT_ID/notificationChannels/NOTIFICATION_CHANNEL
 
 alertStrategy:
   autoClose: 1800s

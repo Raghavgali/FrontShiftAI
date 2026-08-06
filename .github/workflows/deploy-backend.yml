@@ -1,10 +1,30 @@
 name: Deployment Pipeline - Deploy Backend to Cloud Run
 
 on:
+  # Manual button, so a deploy can always be forced from the Actions tab.
+  workflow_dispatch:
+
+  # Direct trigger on main. The CI workflow this used to chain off only fires
+  # on pull_request and workflow_dispatch, which meant the workflow_run link
+  # below could never actually fire and no deploy ever happened. Paths are
+  # limited to the inputs that genuinely change the backend image.
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'backend/requirements.txt'
+      - 'chat_pipeline/**'
+      - 'data_pipeline/data/vector_db/**'
+      - 'Dockerfile.backend'
+      - '.dockerignore'
+      - '.github/workflows/deploy-backend.yml'
+
+  # Retained so that a green CI run on main still promotes automatically if
+  # push triggers are ever restored to the CI workflow.
   workflow_run:
     workflows: ["Deployment Pipeline - Backend CI Tests"]
     branches: [main]
-    types: 
+    types:
       - completed
 
 env:
@@ -16,8 +36,13 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
-    
+    # Only gate on CI conclusion for the chained workflow_run event. For push
+    # and workflow_dispatch there is no workflow_run payload, and gating on it
+    # unconditionally would skip the job every time.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+
     permissions:
       contents: read
       id-token: write
@@ -26,7 +51,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          # workflow_run supplies the CI commit; push and workflow_dispatch
+          # fall back to the SHA that triggered this run.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve image tag
+        run: |
+          echo "IMAGE_SHA=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_ENV"
 
       - name: Free up disk space
         run: |
@@ -53,28 +84,41 @@ jobs:
         run: |
           docker build \
             --platform linux/amd64 \
-            -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ github.sha }} \
+            -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ env.IMAGE_SHA }} \
             -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:latest \
             -f Dockerfile.backend \
             .
 
       - name: Push Docker image to Artifact Registry
         run: |
-          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ github.sha }}
+          docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ env.IMAGE_SHA }}
           docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:latest
 
+      # Database is Neon serverless Postgres, reached over plain TLS from the
+      # public internet. DATABASE_URL is an ordinary Secret Manager secret
+      # holding the full Neon connection string (which already carries
+      # sslmode=require), so there is no Cloud SQL connector to attach.
+      # --clear-cloudsql-instances makes the migration idempotent: gcloud run
+      # deploy otherwise inherits the previous revision's settings, so simply
+      # dropping the old --add-cloudsql-instances flag would leave a stale
+      # attachment behind on a pre-existing service.
+      #
+      # Sizing: measured steady-state RSS is roughly 0.8 to 1.2GB, so 2Gi/2CPU
+      # replaces the previous 4Gi/4CPU. min-instances stays at 0 to avoid
+      # idle billing; expect a cold start while torch and the MiniLM embedding
+      # model load.
       - name: Deploy to Cloud Run
         run: |
           gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ github.sha }} \
+            --image ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ env.IMAGE_SHA }} \
             --platform managed \
             --region ${{ env.REGION }} \
             --allow-unauthenticated \
-            --set-env-vars ENVIRONMENT=production,GENERATION_BACKEND=mercury,CHROMA_REMOTE_URI=gs://frontshiftai-data/chroma_db.tar.gz \
+            --set-env-vars ENVIRONMENT=production,GENERATION_BACKEND=mercury \
             --set-secrets GROQ_API_KEY=GROQ_API_KEY:latest,BRAVE_API_KEY=BRAVE_API_KEY:latest,JWT_SECRET_KEY=JWT_SECRET_KEY:latest,INCEPTION_API_KEY=INCEPTION_API_KEY:latest,DATABASE_URL=DATABASE_URL:latest \
-            --add-cloudsql-instances frontshiftai:us-central1:frontshiftai-db \
-            --memory 4Gi \
-            --cpu 4 \
+            --clear-cloudsql-instances \
+            --memory 2Gi \
+            --cpu 2 \
             --timeout 300 \
             --max-instances 10 \
             --min-instances 0
