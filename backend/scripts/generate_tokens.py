@@ -34,7 +34,7 @@ def create_access_token(data: dict):
 # Define users to generate tokens for
 users = [
     {
-        "sub": "admin@group9.com",
+        "sub": "admin@frontshiftai.com",
         "company": "FrontShiftAI",
         "role": "super_admin",
         "label": "SUPER ADMIN"

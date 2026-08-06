@@ -3,6 +3,7 @@ import pytest
 from services.auth_service import (
     validate_credentials,
     get_company_from_email,
+    get_password_hash,
     add_user,
     delete_user,
     update_user_password
@@ -14,7 +15,7 @@ def test_validate_credentials_success(test_db):
     # Create a test user
     user = User(
         email="test@example.com",
-        password="testpass",
+        password=get_password_hash("testpass"),
         name="Test User",
         role=UserRole.USER,
         company="Test Company"
@@ -40,7 +41,7 @@ def test_validate_credentials_wrong_password(test_db):
     """Test credential validation with wrong password"""
     user = User(
         email="test@example.com",
-        password="testpass",
+        password=get_password_hash("testpass"),
         name="Test User",
         role=UserRole.USER,
         company="Test Company"

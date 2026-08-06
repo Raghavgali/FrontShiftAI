@@ -6,7 +6,8 @@ services:
     environment:
       POSTGRES_DB: frontshiftai
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: MLOpsgroup@9
+      # Local development only. Override in .env; never reuse a real password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localdev}
     ports:
       - "5432:5432"
     volumes:
@@ -22,10 +23,12 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     ports:
-      - "8000:8000"
+      # The image serves on 8080 (gunicorn bind in Dockerfile.backend), so the
+      # published port has to map to 8080, not 8000.
+      - "8000:8080"
     environment:
       # Force PostgreSQL in docker-compose (bypass auto-detection)
-      - DATABASE_URL=postgresql://postgres:MLOpsgroup%409@postgres:5432/frontshiftai
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-localdev}@postgres:5432/frontshiftai
       - ENVIRONMENT=development
       - GROQ_API_KEY=${GROQ_API_KEY}
       - BRAVE_API_KEY=${BRAVE_API_KEY}

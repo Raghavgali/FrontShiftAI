@@ -1,13 +1,50 @@
 """
 Database seeding functions
 """
+import os
+from datetime import date
+
 from db.connection import SessionLocal
 from db.models import Company, User, UserRole, PTOBalance
+from services.auth_service import get_password_hash
+
+# Company the public demo account belongs to. Its handbook is in the corpus,
+# so the demo can answer real questions and file a real PTO request.
+DEMO_COMPANY = "Crouse Medical Practice"
+DEMO_COMPANY_EMAIL_DOMAIN = "crousemedical.com"
+
+
+def _seed_password(env_var: str, dev_default: str) -> str:
+    """Resolve a seed password from the environment.
+
+    Production must supply its own. Outside production we fall back to a
+    well-known development value so local runs and the test suite work with
+    no setup. Passwords are always stored as bcrypt hashes.
+    """
+    value = os.getenv(env_var)
+    if value:
+        return value
+    if os.getenv("ENVIRONMENT") == "production":
+        raise RuntimeError(
+            f"{env_var} must be set when ENVIRONMENT=production. Refusing to "
+            "seed a production database with a default password."
+        )
+    return dev_default
+
 
 def seed_initial_data(db_session=None):
     """Seed database with initial companies and users"""
+    # Resolve credentials before opening a session so a misconfigured
+    # production deploy fails loudly instead of being swallowed below.
+    super_admin_email = os.getenv("SEED_SUPER_ADMIN_EMAIL", "admin@frontshiftai.com")
+    super_admin_password = _seed_password("SEED_SUPER_ADMIN_PASSWORD", "admin123")
+    admin_password = _seed_password("SEED_ADMIN_PASSWORD", "admin123")
+    user_password = _seed_password("SEED_USER_PASSWORD", "password123")
+    demo_password = _seed_password("SEED_DEMO_PASSWORD", "demo1234")
+    current_year = date.today().year
+
     db = db_session if db_session else SessionLocal()
-    
+
     try:
         # Check if already seeded
         existing_companies = db.query(Company).count()
@@ -46,8 +83,8 @@ def seed_initial_data(db_session=None):
         
         # Add Super Admin
         super_admin = User(
-            email="admin@group9.com",
-            password="admin123",
+            email=super_admin_email,
+            password=get_password_hash(super_admin_password),
             name="Super Admin",
             role=UserRole.SUPER_ADMIN,
             company=None
@@ -80,7 +117,7 @@ def seed_initial_data(db_session=None):
         for admin_data in company_admins:
             admin = User(
                 email=admin_data["email"],
-                password="admin123",
+                password=get_password_hash(admin_password),
                 name=admin_data["name"],
                 role=UserRole.COMPANY_ADMIN,
                 company=admin_data["company"]
@@ -89,26 +126,40 @@ def seed_initial_data(db_session=None):
         
         # Add Sample Users
         sample_users = [
-            {"email": "user@crousemedical.com", "name": "John Doe", "company": "Crouse Medical Practice"},
-            {"email": "employee@crousemedical.com", "name": "Jane Smith", "company": "Crouse Medical Practice"},
+            {"email": "user@crousemedical.com", "name": "John Doe", "company": DEMO_COMPANY},
+            {"email": "employee@crousemedical.com", "name": "Jane Smith", "company": DEMO_COMPANY},
         ]
-        
+
         for user_data in sample_users:
             user = User(
                 email=user_data["email"],
-                password="password123",
+                password=get_password_hash(user_password),
                 name=user_data["name"],
                 role=UserRole.USER,
                 company=user_data["company"]
             )
             db.add(user)
-        
-        # NEW: Add PTO Balances for sample users
+
+        # Public demo account. Deliberately a plain USER scoped to one
+        # company, so anyone trying the hosted demo sees the tenant isolation
+        # working and cannot reach another company's data or the admin views.
+        demo_user = User(
+            email=f"demo@{DEMO_COMPANY_EMAIL_DOMAIN}",
+            password=get_password_hash(demo_password),
+            name="Demo Employee",
+            role=UserRole.USER,
+            company=DEMO_COMPANY
+        )
+        db.add(demo_user)
+
+        # PTO balances are keyed by calendar year, so seed the current one or
+        # the agent finds no balance and the demo looks broken.
         pto_balances = [
-            {"email": "user@crousemedical.com", "company": "Crouse Medical Practice", "year": 2025, "total_days": 15.0, "used_days": 0.0, "pending_days": 0.0},
-            {"email": "employee@crousemedical.com", "company": "Crouse Medical Practice", "year": 2025, "total_days": 20.0, "used_days": 2.0, "pending_days": 0.0},
+            {"email": "user@crousemedical.com", "company": DEMO_COMPANY, "year": current_year, "total_days": 15.0, "used_days": 0.0, "pending_days": 0.0},
+            {"email": "employee@crousemedical.com", "company": DEMO_COMPANY, "year": current_year, "total_days": 20.0, "used_days": 2.0, "pending_days": 0.0},
+            {"email": f"demo@{DEMO_COMPANY_EMAIL_DOMAIN}", "company": DEMO_COMPANY, "year": current_year, "total_days": 18.0, "used_days": 3.0, "pending_days": 0.0},
         ]
-        
+
         for balance_data in pto_balances:
             balance = PTOBalance(**balance_data)
             db.add(balance)

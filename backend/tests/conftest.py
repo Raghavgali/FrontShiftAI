@@ -140,7 +140,7 @@ def super_admin_headers(client, test_db):
     # Login as super admin
     response = client.post(
         "/api/auth/login",
-        json={"email": "admin@group9.com", "password": "admin123"}
+        json={"email": "admin@frontshiftai.com", "password": "admin123"}
     )
     
     assert response.status_code == 200, f"Login failed: {response.json()}"

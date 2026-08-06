@@ -4,6 +4,12 @@ import { ArrowLeft } from 'lucide-react';
 
 import FrontShiftLogo from './FrontShiftLogo';
 
+// Kept in the client on purpose: this is a published demo account, not a
+// secret. The deployed values come from build-time vars so the hosted demo
+// and a local run can differ.
+const DEMO_EMAIL = import.meta.env.VITE_DEMO_EMAIL || 'demo@crousemedical.com';
+const DEMO_PASSWORD = import.meta.env.VITE_DEMO_PASSWORD || 'demo1234';
+
 const Login = ({ onLoginSuccess, onBack }) => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -107,23 +113,27 @@ const Login = ({ onLoginSuccess, onBack }) => {
             </button>
           </form>
 
-          {/* Demo Credentials */}
+          {/* Demo account. Scoped to one company on purpose, so trying the
+              hosted demo cannot reach another tenant's data or the admin
+              views. Admin credentials are not published. */}
           <div className="mt-6 pt-6 border-t border-white/10">
-            <p className="text-xs text-white/40 mb-3">Demo Credentials:</p>
-            <div className="space-y-3">
-              <div className="bg-white/5 p-3 rounded-lg">
-                <p className="text-xs text-white/50 mb-1">Regular User:</p>
-                <p className="text-xs text-white/70">user@crousemedical.com / password123</p>
-              </div>
-              <div className="bg-white/5 p-3 rounded-lg">
-                <p className="text-xs text-white/50 mb-1">Company Admin:</p>
-                <p className="text-xs text-white/70">admin@crousemedical.com / admin123</p>
-              </div>
-              <div className="bg-white/5 p-3 rounded-lg">
-                <p className="text-xs text-white/50 mb-1">Super Admin:</p>
-                <p className="text-xs text-white/70">admin@group9.com / admin123</p>
-              </div>
-            </div>
+            <p className="text-xs text-white/40 mb-3">Try the demo:</p>
+            <button
+              type="button"
+              onClick={() => {
+                setEmail(DEMO_EMAIL);
+                setPassword(DEMO_PASSWORD);
+              }}
+              className="w-full bg-white/5 hover:bg-white/10 transition-colors p-3 rounded-lg text-left"
+            >
+              <p className="text-xs text-white/50 mb-1">
+                Demo employee at Crouse Medical Practice
+              </p>
+              <p className="text-xs text-white/70">
+                {DEMO_EMAIL} / {DEMO_PASSWORD}
+              </p>
+              <p className="text-xs text-white/30 mt-1">Click to fill</p>
+            </button>
           </div>
         </div>
 

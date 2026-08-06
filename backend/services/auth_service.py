@@ -5,6 +5,9 @@ from db import SessionLocal, User, Company, UserRole
 from typing import Tuple, List, Dict, Optional
 from sqlalchemy.orm import Session
 import bcrypt
+import logging
+
+logger = logging.getLogger(__name__)
 
 def verify_password(plain_password, hashed_password):
     # bcrypt.checkpw expects bytes
@@ -36,15 +39,20 @@ def validate_credentials(email: str, password: str, db: Optional[Session] = None
         if not user:
             return False, None, None, None
         
-        # Check if password matches (handles both plaintext and hashed for migration)
-        if user.password.startswith("$2b$") or user.password.startswith("$2a$"):
-            if not verify_password(password, user.password):
-                return False, None, None, None
-        else:
-            # Fallback for legacy plaintext passwords (should be migrated!)
-            if user.password != password:
-                return False, None, None, None
-        
+        # Only bcrypt hashes are accepted. A row that is not hashed is a
+        # seeding or migration bug, so it fails closed and gets logged rather
+        # than falling back to a plaintext comparison.
+        if not str(user.password or "").startswith(("$2a$", "$2b$", "$2y$")):
+            logger.error(
+                "Refusing login for %s: stored password is not a bcrypt hash. "
+                "Reset it with update_user_password().",
+                email,
+            )
+            return False, None, None, None
+
+        if not verify_password(password, user.password):
+            return False, None, None, None
+
         return True, user.company, user.role.value, user.name
     
     finally:
