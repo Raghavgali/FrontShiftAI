@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import MonitoringDashboard from './MonitoringDashboard';
+import { API_BASE_URL } from '../config';
 
 const SuperAdminDashboard = ({ onLogout, userInfo }) => {
   const [activeTab, setActiveTab] = useState('companies'); // 'companies' or 'admins'
@@ -36,7 +37,6 @@ const SuperAdminDashboard = ({ onLogout, userInfo }) => {
   const [processingTask, setProcessingTask] = useState(null);
   const [taskStatus, setTaskStatus] = useState(null);
 
-  const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   useEffect(() => {
     fetchData();

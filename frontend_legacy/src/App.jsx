@@ -9,6 +9,7 @@ import LandingPage from './components/LandingPage';
 import SuperAdminDashboard from './components/SuperAdminDashboard';
 import CompanyAdminDashboard from './components/CompanyAdminDashboard';
 import { logout, getUserInfo } from './services/api';
+import { API_BASE_URL } from './config';
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -32,7 +33,6 @@ function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(window.innerWidth >= 768);
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
 
-  const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   // Check authentication on mount
   useEffect(() => {

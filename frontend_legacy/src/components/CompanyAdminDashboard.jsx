@@ -17,6 +17,7 @@ import {
   bulkAddUsers
 } from '../services/api';
 import MonitoringDashboard from './MonitoringDashboard';
+import { API_BASE_URL } from '../config';
 
 const CompanyAdminDashboard = ({ onLogout, userInfo }) => {
   const [activeTab, setActiveTab] = useState('users'); // users, leaves, requests, hr_tickets
@@ -57,7 +58,6 @@ const CompanyAdminDashboard = ({ onLogout, userInfo }) => {
   const [csvFileName, setCsvFileName] = useState('');
   const [pendingCsvUsers, setPendingCsvUsers] = useState([]);
 
-  const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   useEffect(() => {
     if (activeTab === 'users') {

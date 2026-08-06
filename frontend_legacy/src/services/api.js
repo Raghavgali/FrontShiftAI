@@ -1,8 +1,7 @@
 import axios from 'axios';
 import { toast } from 'sonner';
+import { API_BASE_URL, VOICE_API_URL } from '../config';
 
-// Read from .env or fallback to 8000 (matching your backend)
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 console.log("🌐 Using Backend API:", API_BASE_URL);
 
 const api = axios.create({
@@ -752,7 +751,7 @@ export const getMonitoringStats = async (timeRange = '7d') => {
 // flow — the scoped token bridges that gap without weakening regular auth.
 export const createVoiceSession = async (userEmail = null, company = null) => {
   try {
-    const voiceApiUrl = import.meta.env.VITE_VOICE_API_URL || import.meta.env.VITE_MODAL_VOICE_AGENT_URL || 'http://localhost:8001';
+    const voiceApiUrl = VOICE_API_URL;
 
     // Mint a voice-scoped token via backend; uses the request interceptor's
     // auto-attach Authorization header. If the current access token is stale
@@ -796,7 +795,7 @@ export const endVoiceSession = async (sessionId) => {
 // Voice agent health check
 export const voiceAgentHealthCheck = async () => {
   try {
-    const voiceApiUrl = import.meta.env.VITE_VOICE_API_URL || import.meta.env.VITE_MODAL_VOICE_AGENT_URL || 'http://localhost:8001';
+    const voiceApiUrl = VOICE_API_URL;
     const response = await axios.get(`${voiceApiUrl}/health`, { timeout: 10000 });
     return response.data;
   } catch (error) {

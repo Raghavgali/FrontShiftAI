@@ -1,4 +1,20 @@
-name: Deploy Landing Page to GitHub Pages
+name: Deploy Landing Page and Chat App to GitHub Pages
+
+# Publishes two separate Vite apps as one Pages site:
+#   /FrontShiftAI/      landing page      (frontend/)
+#   /FrontShiftAI/app/  chat client       (frontend_legacy/)
+#
+# Each app sets its own Vite "base" when GITHUB_PAGES=true, so the two bundles
+# reference their own assets and never collide.
+#
+# The chat app needs the backend and voice URLs baked in at build time. Those
+# are public URLs that end up readable in a client bundle, so they come from
+# repository *variables* (vars), not secrets:
+#   vars.BACKEND_URL    e.g. https://<service>-<hash>-uc.a.run.app
+#   vars.VOICE_API_URL  e.g. https://<user>--<app>-web-api.modal.run
+# If either is unset the build still succeeds and the app falls back to
+# localhost, which is useless in production but not a build failure. The
+# workflow logs a loud warning in that case.
 
 on:
   workflow_dispatch:
@@ -24,22 +40,87 @@ jobs:
         with:
           node-version: '20.x'
           cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            frontend_legacy/package-lock.json
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Check chat app build variables
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+          VOICE_API_URL: ${{ vars.VOICE_API_URL }}
+        run: |
+          missing=0
+          if [ -z "$BACKEND_URL" ]; then
+            echo "::warning title=BACKEND_URL not set::Repository variable BACKEND_URL is empty. The chat app will fall back to http://localhost:8000 and will not work for real visitors. Set it under Settings > Secrets and variables > Actions > Variables."
+            missing=1
+          else
+            echo "BACKEND_URL is set to $BACKEND_URL"
+          fi
+          if [ -z "$VOICE_API_URL" ]; then
+            echo "::warning title=VOICE_API_URL not set::Repository variable VOICE_API_URL is empty. Voice features will fall back to http://localhost:8001 and will not work for real visitors."
+            missing=1
+          else
+            echo "VOICE_API_URL is set to $VOICE_API_URL"
+          fi
+          if [ "$missing" = "1" ]; then
+            echo "Continuing anyway: a partially configured site still deploys."
+          fi
+
+      # --- Landing page -> artifact root ---
+      - name: Install landing page dependencies
         working-directory: frontend
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "No package-lock.json found, falling back to npm install"
+            npm install
+          fi
 
-      - name: Build with Pages base path
-        run: npm run build
+      - name: Build landing page
         working-directory: frontend
         env:
           GITHUB_PAGES: 'true'
+        run: npm run build
+
+      # --- Chat app -> artifact /app/ ---
+      - name: Install chat app dependencies
+        working-directory: frontend_legacy
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "No package-lock.json found, falling back to npm install"
+            npm install
+          fi
+
+      - name: Build chat app
+        working-directory: frontend_legacy
+        env:
+          GITHUB_PAGES: 'true'
+          VITE_API_URL: ${{ vars.BACKEND_URL }}
+          VITE_VOICE_API_URL: ${{ vars.VOICE_API_URL }}
+        run: npm run build
+
+      # --- Combine into a single Pages artifact ---
+      - name: Assemble Pages site
+        run: |
+          set -euo pipefail
+          rm -rf site
+          mkdir -p site
+          cp -R frontend/dist/. site/
+          mkdir -p site/app
+          cp -R frontend_legacy/dist/. site/app/
+          # Fail loudly rather than publishing a half-built site.
+          test -f site/index.html || { echo "Landing page index.html missing"; exit 1; }
+          test -f site/app/index.html || { echo "Chat app index.html missing"; exit 1; }
+          echo "Assembled site tree:"
+          find site -maxdepth 2 -print
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: frontend/dist
+          path: site
 
   deploy:
     needs: build
