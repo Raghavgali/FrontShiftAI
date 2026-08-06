@@ -10,7 +10,10 @@ The FrontShiftAI backend is a sophisticated, multi-tenant Retrieval-Augmented Ge
 
 ### 1.1 Quick Links
 - **Local API**: [http://localhost:8000/docs](http://localhost:8000/docs)
-- **Production API**: [https://frontshiftai-backend-vvukpmzsxa-uc.a.run.app/docs](https://frontshiftai-backend-vvukpmzsxa-uc.a.run.app/docs)
+- **Production API**: pending. The backend redeploys to Cloud Run under a new
+  personal GCP project, so the old university group URL is gone. Cloud Run
+  prints the assigned URL at the end of the deploy workflow, and it is also
+  stored as the `BACKEND_URL` repository variable once known.
 - **Monitoring (W&B)**: [https://wandb.ai/group9mlops-northeastern-university/FrontShiftAI](https://wandb.ai/group9mlops-northeastern-university/FrontShiftAI)
 
 ### 1.2 System Architecture
@@ -221,7 +224,13 @@ pytest
 Comprehensive documentation is automatically generated via Swagger UI.
 
 - **Local**: `http://localhost:8000/docs`
-- **Production**: `https://frontshiftai-backend-vvukpmzsxa-uc.a.run.app/docs`
+- **Production**: `<CLOUD_RUN_URL>/docs`, where `<CLOUD_RUN_URL>` is the service
+  URL emitted by the deploy workflow. Pending the first deploy into the new
+  GCP project.
+
+The production database is **Neon serverless Postgres**, reached over TLS using
+the `DATABASE_URL` secret from Secret Manager. There is no Cloud SQL instance
+and no Cloud SQL connector attached to the service.
 
 ### Key Endpoints
 - `POST /api/chat/message`: Unified entry point for all agent interactions.

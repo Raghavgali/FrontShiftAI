@@ -9,10 +9,35 @@ The FrontShiftAI Frontend is a modern, high-performance single-page application 
 ---
 
 ### 1.1 Quick Links
-- **Local Development**: [http://localhost:5173](http://localhost:5173)
-- **Production URL (Vercel)**: [https://frontshiftai.vercel.app/](https://frontshiftai.vercel.app/)
-- **Production URL (Cloud Run)**: [https://frontshiftai-frontend-vvukpmzsxa-uc.a.run.app](https://frontshiftai-frontend-vvukpmzsxa-uc.a.run.app)
-- **Deployment Repo**: [https://github.com/MLOpsGroup9/FrontShiftAI](https://github.com/MLOpsGroup9/FrontShiftAI)
+- **Local Development**: [http://localhost:3000](http://localhost:3000) (the port set in `vite.config.js`)
+- **Production URL**: `https://raghavgali.github.io/FrontShiftAI/app/`, live once
+  the GitHub Pages workflow has been run.
+- **Deployment Repo**: [https://github.com/raghavgali/FrontShiftAI](https://github.com/raghavgali/FrontShiftAI)
+
+### 1.1.1 Hosting and Configuration
+
+This app is a static bundle published to **GitHub Pages** by
+`.github/workflows/deploy-pages.yml`, which builds the landing page in
+`frontend/` to the site root and this app to `/app/`. Vercel and Cloud Run are
+no longer used.
+
+Because the site is served from a subpath, `vite.config.js` sets
+`base: "/FrontShiftAI/app/"` whenever `GITHUB_PAGES=true`. Local builds stay at
+`/`. The app renders by conditional state rather than a router, so no SPA
+fallback rewrite is needed.
+
+Backend URLs are baked in at build time from repository **variables** (not
+secrets, since they are visible in the shipped bundle):
+
+| Build env var | Source | Fallback |
+|---------------|--------|----------|
+| `VITE_API_URL` | `vars.BACKEND_URL` | `http://localhost:8000` |
+| `VITE_VOICE_API_URL` | `vars.VOICE_API_URL` | `http://localhost:8001` |
+
+Both are resolved in one place, `src/config.js`, which exports `API_BASE_URL`
+and `VOICE_API_URL`. Import from there rather than reading `import.meta.env`
+at a call site. If a variable is unset the build still succeeds and the
+localhost fallback applies.
 
 ### 1.2 System Architecture
 

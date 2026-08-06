@@ -21,11 +21,36 @@ The **Voice Pipeline** extends FrontShiftAI's multi-agent platform with **ultra-
 
 ## Deployment Access
 
-| Component | Provider | URL |
-|-----------|----------|-----|
-| **Voice Session API** | Modal | [https://raghavg--frontshiftai-voice-agent-web-api.modal.run](https://raghavg--frontshiftai-voice-agent-web-api.modal.run) |
-| **LiveKit Cloud** | LiveKit | wss://frontshiftai-vkrebx4e.livekit.cloud |
-| **Backend API** | Cloud Run | [https://frontshiftai-backend-vvukpmzsxa-uc.a.run.app](https://frontshiftai-backend-vvukpmzsxa-uc.a.run.app) |
+All three endpoints are environment specific and are **not** committed anywhere
+in this repository. The previous values pointed at a university group's Modal
+account, LiveKit project, and Cloud Run service, all of which are dead.
+
+| Component | Provider | Where the URL comes from |
+|-----------|----------|--------------------------|
+| **Voice Session API** | Modal | Printed by `modal deploy`. Stored as the `VOICE_API_URL` repository variable so the chat app can reach it. |
+| **LiveKit Cloud** | LiveKit | `LIVEKIT_URL`, of the form `wss://<your-project>.livekit.cloud`. Required, no default. |
+| **Backend API** | Cloud Run | `VOICE_AGENT_BACKEND_URL`. Printed by the backend deploy workflow. |
+
+### Required configuration
+
+`voice_pipeline/configs/default.yaml` intentionally ships with `backend.url` and
+`backend.token` empty. `voice_pipeline/utils/config.py` reads the environment
+first and raises a `ValueError` when neither the environment nor the YAML
+supplies a value, so a missing setting fails immediately instead of silently
+pointing at the wrong backend.
+
+| Variable | Purpose |
+|----------|---------|
+| `VOICE_AGENT_BACKEND_URL` | Backend base URL the agent calls for tools and context. |
+| `VOICE_AGENT_JWT` | Backend issued JWT for the agent. Supply as a Modal secret. |
+| `LIVEKIT_URL` | LiveKit Cloud websocket URL. |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | LiveKit credentials used to mint room tokens. |
+
+> **Security note.** Earlier revisions of `configs/default.yaml` and
+> `scripts/secret_sanity.py` contained a committed super admin JWT. It has been
+> removed from both files, but it still exists in git history and must be
+> treated as compromised. Rotate `JWT_SECRET_KEY` so any copy of that token can
+> no longer be verified.
 
 ---
 

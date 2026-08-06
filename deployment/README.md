@@ -4,15 +4,22 @@
 
 ## 📖 Abstract
 
-This document details the production infrastructure, deployment pipeline, and security standard for FrontShiftAI. The system is deployed as a serverless containerized application on **Google Cloud Run**, orchestrated via **GitHub Actions**. It relies on **Cloud SQL**, **Cloud Storage**, and **Secret Manager** to provide a secure, auto-scaling environment.
+This document details the production infrastructure, deployment pipeline, and security standard for FrontShiftAI. The backend is deployed as a serverless containerized application on **Google Cloud Run**, orchestrated via **GitHub Actions**, using **Secret Manager** for credentials and **Neon serverless Postgres** for relational data. The two frontends are static bundles served from **GitHub Pages**.
 
 ---
 
 ### 🔗 Deployment Access
-- **Frontend App (Vercel)**: [https://frontshiftai.vercel.app/](https://frontshiftai.vercel.app/)
-- **Frontend App (Cloud Run)**: [https://frontshiftai-frontend-vvukpmzsxa-uc.a.run.app](https://frontshiftai-frontend-vvukpmzsxa-uc.a.run.app)
-- **Backend API Docs**: [https://frontshiftai-backend-vvukpmzsxa-uc.a.run.app/docs](https://frontshiftai-backend-vvukpmzsxa-uc.a.run.app/docs)
-- **Repository**: [https://github.com/MLOpsGroup9/FrontShiftAI](https://github.com/MLOpsGroup9/FrontShiftAI)
+- **Landing Page**: [https://raghavgali.github.io/FrontShiftAI/](https://raghavgali.github.io/FrontShiftAI/)
+- **Chat App**: `https://raghavgali.github.io/FrontShiftAI/app/`, published by the
+  same GitHub Pages workflow. Live once that workflow has been run.
+- **Backend API Docs**: pending. Redeploying to Cloud Run under a personal GCP
+  project; the deploy workflow prints the assigned URL.
+- **Repository**: [https://github.com/raghavgali/FrontShiftAI](https://github.com/raghavgali/FrontShiftAI)
+
+> **Hosting note.** The frontend is no longer served from Vercel or Cloud Run.
+> Both the landing page and the chat client are static bundles published to
+> GitHub Pages by `.github/workflows/deploy-pages.yml`. The database is Neon
+> serverless Postgres rather than Cloud SQL.
 
 ## ☁️ Cloud Resources Inventory
 
@@ -21,12 +28,18 @@ We utilize 7 core Google Cloud Platform services to effect a serverless, auto-sc
 | Service | Resource Name | Role | Tier/Config |
 |---------|---------------|------|-------------|
 | **Cloud Run** | `frontshiftai-backend` | **Backend**: Hosts FastAPI, Agents, and RAG logic. | 2Gi RAM, 2 vCPU, Scale 0-10 |
-| **Cloud Run** | `frontshiftai-frontend` | **Frontend**: Serves React static files via Nginx. | 512Mi RAM, 1 vCPU, Scale 0-10 |
-| **Cloud SQL** | `frontshiftai-db` | **Database**: Managed PostgreSQL 15 for relational data. | `db-f1-micro` (Shared CPU) |
-| **Cloud Storage** | `frontshiftai-data` | **Blob Store**: Hosts ChromaDB artifacts and PDF handbooks. | Standard Class (US Main) |
+| **GitHub Pages** | `raghavgali.github.io/FrontShiftAI` | **Frontend**: Landing page at `/`, chat client at `/app/`. | Static hosting, no container |
+| **Neon** | Serverless Postgres | **Database**: Postgres for relational data, injected as `DATABASE_URL`. | Serverless, scales to zero |
 | **Secret Manager** | Multiple Keys | **Security**: Injects API keys and DB creds at runtime. | Automatic Replication |
 | **Artifact Registry** | `frontshiftai-*` | **Registry**: Stores versioned Docker images. | Standard Docker Repository |
-| **Cloud Monitoring** | `frontshiftai` | **Observability**: Logs, Metrics, and Latency tracking. | Standard Suite |
+| **Cloud Monitoring** | Alert policies | **Observability**: Logs, Metrics, and Latency tracking. | Standard Suite |
+
+Not all of the above are Google Cloud services any more: GitHub Pages hosts the
+frontends and Neon hosts the database. The Cloud Storage bucket that used to
+hold ChromaDB artifacts is no longer required, because the vector store is
+git tracked under `data_pipeline/data/vector_db/` and is baked directly into
+the backend image. Notification channel ids in `monitoring/gcp-alerts.yaml`
+are placeholders that must be filled in per project.
 
 ---
 
