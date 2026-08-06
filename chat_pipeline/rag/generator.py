@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import atexit
+import importlib
 import json
 import logging
 import os
 import time
+from contextlib import nullcontext
 from dotenv import load_dotenv
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Literal, Optional, Tuple
@@ -105,6 +107,53 @@ def _emit_llm_metric(fn_name: str, *args, **kwargs) -> None:
         fn(*args, **kwargs)
     except Exception:  # noqa: BLE001
         pass
+
+
+_RESILIENCE_MODULE: Any = None
+_RESILIENCE_RESOLVED = False
+
+
+def _resilience() -> Any:
+    """Best-effort handle on ``backend/utils/resilience.py`` (Phase 6B).
+
+    chat_pipeline must stay importable without the backend package on
+    sys.path (same constraint as ``_emit_llm_metric``), so a missing module
+    degrades to "no breaker" rather than an ImportError. Both spellings are
+    tried because the module is imported as ``utils.resilience`` when the app
+    runs with ``backend/`` on sys.path and as ``backend.utils.resilience``
+    when the repo root is. Whichever wins, every caller in that process
+    resolves the same module object, so breaker state stays shared.
+    """
+    global _RESILIENCE_MODULE, _RESILIENCE_RESOLVED
+    if _RESILIENCE_RESOLVED:
+        return _RESILIENCE_MODULE
+    _RESILIENCE_RESOLVED = True
+    for module_name in ("utils.resilience", "backend.utils.resilience"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # noqa: BLE001 - optional dependency by design
+            continue
+        if hasattr(module, "circuit_guard"):
+            _RESILIENCE_MODULE = module
+            return _RESILIENCE_MODULE
+    logger.debug("resilience helper unavailable; LLM circuit breakers disabled")
+    return None
+
+
+def _provider_guard(provider: str):
+    """Circuit-breaker guard around one provider call.
+
+    Returns a null context when the resilience helper is unavailable, so
+    call sites stay a plain ``with`` statement. An open breaker raises
+    ``CircuitOpenError``, which :func:`stream_response` handles like any
+    other backend failure: log it and advance the fallback chain. That is
+    the Phase 6B win, since the skip costs microseconds instead of the
+    provider's full retry budget.
+    """
+    module = _resilience()
+    if module is None:
+        return nullcontext()
+    return module.circuit_guard(provider, policy="external_llm")
 
 
 def _classify_error(exc: BaseException) -> str:
@@ -291,6 +340,18 @@ def _stream_from_hf(prompt: str, params: Dict[str, Any]) -> Generator[str, None,
 
 
 def _call_mercury_api(prompt: str, params: Dict[str, Any]) -> str:
+    """Call Mercury under its circuit breaker (Phase 6B).
+
+    The retry envelope stays inside ``_call_mercury_api_inner`` because it is
+    provider-specific (429 ``Retry-After`` handling). The breaker wraps the
+    whole thing: one exhausted call is one failure, three in a row and
+    Mercury is skipped for the recovery window.
+    """
+    with _provider_guard("mercury"):
+        return _call_mercury_api_inner(prompt, params)
+
+
+def _call_mercury_api_inner(prompt: str, params: Dict[str, Any]) -> str:
     """Call the Inception Labs Mercury API as a fallback."""
 
     if not INCEPTION_API_KEY:
@@ -395,6 +456,12 @@ def _call_mercury_api(prompt: str, params: Dict[str, Any]) -> str:
 
 
 def _call_groq_api(prompt: str, params: Dict[str, Any]) -> str:
+    """Call Groq under its circuit breaker (Phase 6B)."""
+    with _provider_guard("groq"):
+        return _call_groq_api_inner(prompt, params)
+
+
+def _call_groq_api_inner(prompt: str, params: Dict[str, Any]) -> str:
     """Call the Groq API (OpenAI-compatible) as a backend."""
 
     if not GROQ_API_KEY:
@@ -480,6 +547,27 @@ def _call_groq_api(prompt: str, params: Dict[str, Any]) -> str:
 
 
 def _stream_openai_compatible_api(
+    url: str,
+    api_key: Optional[str],
+    provider: str,
+    model: str,
+    prompt: str,
+    params: Dict[str, Any],
+) -> Generator[str, None, None]:
+    """Stream from ``provider`` under its circuit breaker (Phase 6B).
+
+    The guard is entered on first iteration, i.e. immediately before the
+    request goes out, and closed when the stream is exhausted. A consumer
+    that abandons the stream (``GeneratorExit``) records neither success nor
+    failure: that says nothing about provider health.
+    """
+    with _provider_guard(provider):
+        yield from _stream_openai_compatible_api_inner(
+            url, api_key, provider, model, prompt, params
+        )
+
+
+def _stream_openai_compatible_api_inner(
     url: str,
     api_key: Optional[str],
     provider: str,
@@ -591,6 +679,12 @@ def _stream_openai_api(prompt: str, params: Dict[str, Any]) -> Generator[str, No
 
 
 def _call_openai_api(prompt: str, params: Dict[str, Any]) -> str:
+    """Call OpenAI under its circuit breaker (Phase 6B)."""
+    with _provider_guard("openai"):
+        return _call_openai_api_inner(prompt, params)
+
+
+def _call_openai_api_inner(prompt: str, params: Dict[str, Any]) -> str:
     """Call the OpenAI API as a backend."""
 
     api_key = os.getenv("OPENAI_API_KEY")

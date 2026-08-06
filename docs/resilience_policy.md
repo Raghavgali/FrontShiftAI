@@ -52,10 +52,53 @@ Three states: **closed** (pass-through) → **open** (fail-fast) → **half-open
 - Failure in half-open → re-open, reset the 60s cooldown
 
 Breakers are **keyed per-call-target** (e.g. `mercury`, `groq`, `openai`,
-`brave`). Mercury being down does not trip Groq.
+`brave`). Mercury being down does not trip Groq. The key is shared across
+callers on purpose: "Mercury is down" is one fact, whoever discovered it, so
+the agent LLM client and the RAG generator feed the same breaker.
 
-State is exposed as a Prometheus gauge (`circuit_breaker_state{provider="..."}`)
-once Phase 7 lands.
+State is exposed as the Prometheus gauge `circuit_breaker_state{key="..."}`
+(0 = closed, 1 = half-open, 2 = open), published on every transition from
+`_publish_state`. Every decorated target registers its key at import time, so
+a provider that has never been called still shows a `closed` series rather
+than a gap in the dashboard.
+
+### Two ways to attach a breaker
+
+| Helper | Failure accounting | Use when |
+|---|---|---|
+| `@resilient(policy=…, breaker_key=…)` | one failure **per attempt**, so a single call can open the breaker | the call site has no retry logic of its own (the default) |
+| `circuit_guard(key, policy=…)` | one failure **per guarded block** | the call site already owns provider-specific retry semantics (the RAG generator's 429 `Retry-After` handling) and must not be wrapped in a second retry loop |
+
+Two further rules that matter for latency:
+
+- **An open breaker abandons the remaining retry budget.** `@resilient`
+  re-checks the breaker after each failure; once it opens mid-call, the
+  remaining retries are skipped. Otherwise a 4-attempt policy would keep
+  dialing a target it had already declared down.
+- **A skipped call raises `CircuitOpenError`, not the provider's error.**
+  Fallback chains must treat it like any other failure and advance to the
+  next provider. That is the entire point: the skip costs microseconds
+  instead of the provider's full retry budget.
+
+### Timeout exemptions
+
+The policy's `timeout_s` is the contract, and the sync `@resilient` path
+cannot enforce it (no safe way to interrupt a blocking socket off the main
+thread), so call sites pass it to their HTTP client explicitly. Two
+deliberate exceptions, both recorded in `docs/resilience_audit.md`:
+
+- **Local Ollama** (`OLLAMA_TIMEOUT_S`, default 60s): dev-only provider,
+  last in the fallback chain, generating on CPU where 8s is below the floor
+  for a useful completion.
+- **RAG generator full completions** (`REMOTE_TIMEOUT`, default 45s): a
+  1024-token non-streaming completion legitimately exceeds 8s. The breaker,
+  not the timeout, is what keeps a dead provider cheap here.
+
+## Correlation
+
+Every failure logged by these helpers carries the request's `request_id`
+(see `backend/observability/tracing.py`), so a breaker opening in the
+dashboard can be traced to the exact requests that opened it.
 
 ## Enforcement
 

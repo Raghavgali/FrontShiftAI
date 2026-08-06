@@ -33,9 +33,10 @@ import logging
 import random
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, TypeVar
+from typing import Any, Callable, Dict, Iterator, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -246,8 +247,51 @@ def _get_breaker(key: str, policy: Policy) -> CircuitBreaker:
         return breaker
 
 
+def get_breaker(key: str, policy: str = "external_llm") -> CircuitBreaker:
+    """Public accessor for the breaker registered under ``key``.
+
+    Creates it on first use with the named policy's thresholds. Use this
+    when a call site needs the breaker without the retry envelope (see
+    :func:`circuit_guard`).
+    """
+    return _get_breaker(key, get_policy(policy))
+
+
 class CircuitOpenError(RuntimeError):
     """Raised when a @resilient call is short-circuited by an open breaker."""
+
+
+@contextmanager
+def circuit_guard(key: str, policy: str = "external_llm") -> Iterator[CircuitBreaker]:
+    """Breaker-only guard for call sites that own their own retry loop.
+
+    ``@resilient`` is the default choice. This exists for the LLM generator,
+    which already implements provider-specific retry semantics (429
+    ``Retry-After`` handling, per-provider backoff) that we do not want to
+    wrap in a second retry loop. The guard contributes exactly the missing
+    piece: fail fast while the provider is known-down.
+
+    Failure accounting differs from ``@resilient`` by design: one guarded
+    block is one failure, so with the default threshold of 3 the breaker
+    opens after 3 consecutive *calls* fail (each of which may have retried
+    internally). ``@resilient`` counts every attempt, so it can open inside
+    a single call. Both feed the same per-key breaker, which is what we
+    want: "mercury is down" is one fact, whoever discovered it.
+
+    ``GeneratorExit``/``KeyboardInterrupt`` are deliberately not recorded --
+    a consumer abandoning a partially consumed stream says nothing about
+    provider health.
+    """
+    breaker = get_breaker(key, policy)
+    if not breaker.allow():
+        raise CircuitOpenError(f"circuit breaker open for {key}; skipping call")
+    try:
+        yield breaker
+    except Exception:
+        breaker.record_failure()
+        raise
+    else:
+        breaker.record_success()
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +312,21 @@ def resilient(
 
     def decorator(fn: Callable[..., T]) -> Callable[..., T]:
         key = breaker_key or f"{fn.__module__}.{fn.__qualname__}"
-        breaker = _get_breaker(key, pol) if pol.use_breaker else None
+        # Pre-register at decoration time so dashboards see a "closed" series
+        # for every protected target before its first call.
+        if pol.use_breaker:
+            _get_breaker(key, pol)
+
+        def _breaker() -> Optional[CircuitBreaker]:
+            # Resolved per call, not captured at decoration time: tests can
+            # reset the registry, and a stale captured object would silently
+            # keep its own state.
+            return _get_breaker(key, pol) if pol.use_breaker else None
 
         if asyncio.iscoroutinefunction(fn):
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                breaker = _breaker()
                 if breaker is not None and not breaker.allow():
                     raise CircuitOpenError(
                         f"circuit breaker open for {key}; skipping call"
@@ -292,6 +346,12 @@ def resilient(
                         last_exc = exc
                     if breaker is not None:
                         breaker.record_failure()
+                        if breaker.state is BreakerState.OPEN:
+                            # The whole point of Phase 6B: once the target is
+                            # known-down, stop paying for the rest of the
+                            # retry budget and let the caller fall through to
+                            # the next provider.
+                            break
                     if attempt < pol.max_retries:
                         delay = pol.sleep_for(attempt + 1)
                         if delay:
@@ -302,6 +362,7 @@ def resilient(
 
         @functools.wraps(fn)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            breaker = _breaker()
             if breaker is not None and not breaker.allow():
                 raise CircuitOpenError(
                     f"circuit breaker open for {key}; skipping call"
@@ -322,6 +383,8 @@ def resilient(
                     last_exc = exc
                 if breaker is not None:
                     breaker.record_failure()
+                    if breaker.state is BreakerState.OPEN:
+                        break
                 if attempt < pol.max_retries:
                     delay = pol.sleep_for(attempt + 1)
                     if delay:
