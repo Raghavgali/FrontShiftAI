@@ -55,6 +55,29 @@ class MessageResponse(BaseModel):
     created_at: str
 
 
+# Phase 5E: keywords checked in the *fallback* path, i.e. only when LLM intent
+# detection raised. Before this list existed, any non-question statement fell
+# straight through to HR Ticket, so "time off next week" or "sick day tomorrow"
+# opened an HR ticket instead of reaching the PTO agent. These are looser than
+# the high-confidence `pto_strong` list above on purpose: the fallback has no
+# LLM to disambiguate, and a PTO agent turn is cheap and reversible while a
+# wrongly filed HR ticket is neither.
+PTO_FALLBACK_KEYWORDS = (
+    'pto', 'p t o', 'paid time off', 'time off', 'timeoff',
+    'vacation', 'vacations', 'holiday leave', 'annual leave',
+    'leave', 'leaves', 'on leave', 'sick day', 'sick days', 'sick leave',
+    'day off', 'days off', 'off next week', 'off tomorrow',
+    'parental leave', 'maternity leave', 'paternity leave',
+    'unpaid leave', 'bereavement', 'personal day', 'personal days',
+    'my balance', 'leave balance', 'time-off',
+)
+
+
+def _matches_pto_fallback(message_lower: str) -> bool:
+    """True when a fallback-path message looks like a PTO request."""
+    return any(keyword in message_lower for keyword in PTO_FALLBACK_KEYWORDS)
+
+
 def detect_intent(message: str) -> dict:
     """
     Detect user intent and which agent should handle it.
@@ -156,10 +179,17 @@ JSON format:
                          'tell me', 'explain', 'describe', 'define']
         
         if any(word in message_lower for word in question_words):
+            # Questions about policy stay on RAG, matching what the LLM prompt
+            # above asks for ("What is the PTO policy?" is a handbook lookup).
             return {'agent': 'rag', 'confidence': 'low'}
-        else:
-            # If no question words, likely an action request
-            return {'agent': 'hr_ticket', 'confidence': 'low'}
+
+        # Phase 5E: a non-question statement about time off is a PTO action,
+        # not an HR escalation. Checked before the HR fallback below.
+        if _matches_pto_fallback(message_lower):
+            return {'agent': 'pto', 'confidence': 'low'}
+
+        # If no question words and nothing PTO-shaped, likely an HR request
+        return {'agent': 'hr_ticket', 'confidence': 'low'}
 
 
 @router.post("/message", response_model=ChatResponse)
