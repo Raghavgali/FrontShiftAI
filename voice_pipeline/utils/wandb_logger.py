@@ -1,10 +1,18 @@
 """
 Weights & Biases (wandb) integration for voice pipeline metrics tracking.
+
+Phase 5D: W&B is treated as a nice-to-have sink, not the only one. Every
+metric also goes to ``metrics.jsonl`` in the session log directory whenever
+there is no live W&B run, and a W&B failure is logged at ERROR instead of
+being swallowed. Neither path can raise into a live call.
 """
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+from voice_pipeline.utils.metrics_sink import FileMetricsSink
 
 logger = logging.getLogger(__name__)
 
@@ -24,34 +32,78 @@ class WandbLogger:
     Handles session-level run initialization and metric logging.
     """
 
-    def __init__(self, session_id: str, enabled: Optional[bool] = False):
+    def __init__(
+        self,
+        session_id: str,
+        enabled: Optional[bool] = False,
+        *,
+        log_dir: Optional[Path] = None,
+        file_sink: Optional[FileMetricsSink] = None,
+    ):
         """
         Initialize wandb logger for a voice session.
 
         Args:
             session_id: Unique session identifier
             enabled: Override to enable/disable wandb. If None, checks WANDB_MODE env var
+            log_dir: Session log directory for the metrics.jsonl fallback
+            file_sink: Pre-built fallback sink (tests inject a tmp_path one)
         """
         self.session_id = session_id
         self.run = None
         self._step_counter = 0
 
+        # Phase 5D: the fallback sink always exists. It is used whenever there
+        # is no live W&B run, so metrics are never silently dropped.
+        self.file_sink = file_sink or FileMetricsSink(session_id, log_dir=log_dir)
+        self._fallback_reason: Optional[str] = None
+        self._logged_unavailable = False
+
+        # Was W&B actually asked for? A deliberate opt-out is not an outage,
+        # so it must not be reported at ERROR.
+        wandb_mode = os.getenv("WANDB_MODE", "disabled").lower()
+        self._wandb_requested = bool(enabled) or (
+            enabled is None and wandb_mode != "disabled"
+        )
+
         # Check if wandb is enabled
         if enabled is None:
-            wandb_mode = os.getenv("WANDB_MODE", "disabled").lower()
             enabled = wandb_mode != "disabled" and WANDB_AVAILABLE
 
-        self.enabled = enabled and WANDB_AVAILABLE
+        self.enabled = bool(enabled) and WANDB_AVAILABLE
 
         if not WANDB_AVAILABLE and enabled:
-            logger.warning(
+            self._mark_unavailable(
+                "wandb_not_installed",
                 "wandb logging requested but wandb is not installed. "
-                "Install with: pip install wandb"
+                "Install with: pip install wandb",
             )
             self.enabled = False
 
         if self.enabled:
             self._initialize_run()
+
+        if not self.enabled and self._fallback_reason is None:
+            # Explicitly disabled: expected, so INFO, but say where the
+            # metrics actually go so nobody hunts for a dashboard.
+            self._fallback_reason = "wandb_disabled"
+            logger.info(
+                "W&B disabled for this session; writing voice metrics to %s",
+                self.file_sink.path,
+            )
+
+    def _mark_unavailable(self, reason: str, message: str) -> None:
+        """Record a genuine W&B outage at ERROR (Phase 5D), once per session."""
+        self._fallback_reason = reason
+        if self._logged_unavailable:
+            return
+        self._logged_unavailable = True
+        logger.error(
+            "%s Voice metrics fall back to %s",
+            message,
+            self.file_sink.path,
+            extra={"session_id": self.session_id, "fallback_reason": reason},
+        )
 
     def _initialize_run(self) -> None:
         """Initialize a wandb run for this voice session."""
@@ -101,6 +153,10 @@ class WandbLogger:
                 extra={"session_id": self.session_id},
                 exc_info=True
             )
+            self._mark_unavailable(
+                "wandb_init_failed",
+                f"Failed to initialize wandb run: {e}.",
+            )
             self.enabled = False
 
     def log_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
@@ -111,14 +167,18 @@ class WandbLogger:
             metrics: Dictionary of metric name -> value
             step: Optional step counter (auto-increments if not provided)
         """
+        if step is None:
+            step = self._step_counter
+            self._step_counter += 1
+
         if not self.enabled or not self.run:
+            # No live run: straight to the file sink (Phase 5D).
+            self.file_sink.write(
+                metrics, reason=self._fallback_reason or "wandb_disabled", step=step
+            )
             return
 
         try:
-            if step is None:
-                step = self._step_counter
-                self._step_counter += 1
-
             # Add timestamp to metrics
             metrics_with_ts = {
                 **metrics,
@@ -137,11 +197,14 @@ class WandbLogger:
             )
 
         except Exception as e:
-            logger.error(
-                f"Failed to log metrics to wandb: {e}",
-                extra={"session_id": self.session_id, "metrics": metrics},
-                exc_info=True
+            # W&B broke mid-session. Report it once at ERROR, stop trying, and
+            # keep the metrics by writing them to disk instead.
+            self._mark_unavailable(
+                "wandb_log_failed",
+                f"Failed to log metrics to wandb: {e}.",
             )
+            self.enabled = False
+            self.file_sink.write(metrics, reason="wandb_log_failed", step=step)
 
     def log_rag_metrics(
         self,

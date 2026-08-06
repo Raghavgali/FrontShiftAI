@@ -1,8 +1,11 @@
 import logging
+import os
 import threading
 from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict, Optional
+
+from voice_pipeline.utils.metrics_sink import FileMetricsSink
 
 from livekit.agents.metrics import (
     STTMetrics,
@@ -95,6 +98,49 @@ def _safe_inc_error(source: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# W&B call guard (Phase 5D)
+# ---------------------------------------------------------------------------
+#
+# WandbLogger handles its own W&B outage -> file fallback. This guard covers
+# the remaining hole: any other exception out of the logger object (a partially
+# initialised run, a duck-typed stand-in) used to propagate into the metrics
+# coroutine and take the whole metric with it. Now the reporter's structured
+# payload lands in metrics.jsonl and the failure is reported at ERROR.
+
+_fallback_sink_lock = threading.Lock()
+_fallback_sink: Optional[FileMetricsSink] = None
+
+
+def _get_fallback_sink() -> FileMetricsSink:
+    global _fallback_sink
+    with _fallback_sink_lock:
+        if _fallback_sink is None:
+            _fallback_sink = FileMetricsSink(os.getenv("VOICE_SESSION_ID"))
+        return _fallback_sink
+
+
+def _safe_wandb(
+    wandb_logger: Optional[Any],
+    method: str,
+    payload: Dict[str, Any],
+    **kwargs: Any,
+) -> None:
+    """Call ``wandb_logger.<method>(**kwargs)``; never raise, never lose data."""
+    if not wandb_logger:
+        return
+    try:
+        getattr(wandb_logger, method)(**kwargs)
+    except Exception as exc:  # noqa: BLE001 - metrics must not break a call
+        logger.error(
+            "W&B logging via %s failed: %s. Writing metrics to the local file sink.",
+            method,
+            exc,
+            exc_info=True,
+        )
+        _get_fallback_sink().write(payload, reason=f"{method}_failed")
+
+
 def _serialize_value(value: Any) -> Any:
     """Normalize enums/datetimes so logs stay JSON-serializable."""
     if isinstance(value, datetime):
@@ -139,14 +185,16 @@ class STTMetricsReporter:
         if getattr(metrics, "error", None):
             _safe_inc_error("stt")
 
-        # Log to wandb if available
-        if self.wandb_logger:
-            self.wandb_logger.log_stt_metrics(
-                duration=metrics.duration,
-                audio_duration=metrics.audio_duration,
-                speech_id=getattr(metrics, "speech_id", None),
-                error=getattr(metrics, "error", None),
-            )
+        # Log to wandb if available (falls back to metrics.jsonl on failure)
+        _safe_wandb(
+            self.wandb_logger,
+            "log_stt_metrics",
+            payload,
+            duration=metrics.duration,
+            audio_duration=metrics.audio_duration,
+            speech_id=getattr(metrics, "speech_id", None),
+            error=getattr(metrics, "error", None),
+        )
 
     async def on_eou_metrics_collected(self, metrics: EOUMetrics) -> None:
         payload = _metrics_payload(
@@ -199,16 +247,18 @@ class LLMMetricsReporter:
         if metrics.cancelled:
             _safe_inc_error("llm")
 
-        # Log to wandb if available
-        if self.wandb_logger:
-            self.wandb_logger.log_llm_metrics(
-                duration=metrics.duration,
-                ttft=metrics.ttft,
-                completion_tokens=metrics.completion_tokens,
-                prompt_tokens=metrics.prompt_tokens,
-                tokens_per_second=metrics.tokens_per_second,
-                error=None,
-            )
+        # Log to wandb if available (falls back to metrics.jsonl on failure)
+        _safe_wandb(
+            self.wandb_logger,
+            "log_llm_metrics",
+            payload,
+            duration=metrics.duration,
+            ttft=metrics.ttft,
+            completion_tokens=metrics.completion_tokens,
+            prompt_tokens=metrics.prompt_tokens,
+            tokens_per_second=metrics.tokens_per_second,
+            error=None,
+        )
         
 
 
@@ -251,15 +301,17 @@ class TTSMetricsReporter:
             e2e = max(0.0, metrics.timestamp - eou_ts)
             _safe_observe(voice_e2e_latency_seconds, value=e2e)
 
-        # Log to wandb if available
-        if self.wandb_logger:
-            self.wandb_logger.log_tts_metrics(
-                duration=metrics.duration,
-                ttfb=metrics.ttfb,
-                audio_duration=metrics.audio_duration,
-                characters_count=metrics.characters_count,
-                error=metrics.error,
-            )
+        # Log to wandb if available (falls back to metrics.jsonl on failure)
+        _safe_wandb(
+            self.wandb_logger,
+            "log_tts_metrics",
+            payload,
+            duration=metrics.duration,
+            ttfb=metrics.ttfb,
+            audio_duration=metrics.audio_duration,
+            characters_count=metrics.characters_count,
+            error=metrics.error,
+        )
         
 
 
@@ -282,13 +334,15 @@ class VADMetricsReporter:
         )
         logger.info("vad_event", extra={"metrics": payload})
 
-        # Log to wandb if available
-        if self.wandb_logger:
-            self.wandb_logger.log_vad_metrics(
-                idle_time=event.idle_time,
-                inference_duration=event.inference_duration_total,
-                inference_count=event.inference_count,
-            )
+        # Log to wandb if available (falls back to metrics.jsonl on failure)
+        _safe_wandb(
+            self.wandb_logger,
+            "log_vad_metrics",
+            payload,
+            idle_time=event.idle_time,
+            inference_duration=event.inference_duration_total,
+            inference_count=event.inference_count,
+        )
 
 
 class RAGMetricsReporter:
@@ -361,15 +415,17 @@ class RAGMetricsReporter:
             except Exception:  # noqa: BLE001
                 pass
 
-        # Log to wandb if available
-        if self.wandb_logger:
-            self.wandb_logger.log_rag_metrics(
-                query=query,
-                total_duration=total_duration,
-                backend_duration=backend_duration,
-                retrieval_duration=retrieval_duration,
-                generation_duration=generation_duration,
-                sources_count=sources_count,
-                cache_hit=cache_hit,
-                error=str(error) if error else None,
-            )
+        # Log to wandb if available (falls back to metrics.jsonl on failure)
+        _safe_wandb(
+            self.wandb_logger,
+            "log_rag_metrics",
+            payload,
+            query=query,
+            total_duration=total_duration,
+            backend_duration=backend_duration,
+            retrieval_duration=retrieval_duration,
+            generation_duration=generation_duration,
+            sources_count=sources_count,
+            cache_hit=cache_hit,
+            error=str(error) if error else None,
+        )

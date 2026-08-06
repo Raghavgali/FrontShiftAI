@@ -49,11 +49,22 @@ SECRETS = [
     modal.Secret.from_name("voice-agent-backend"),
 ]
 
-# Add wandb secret if available (optional)
+# Where the worker writes logs and the Phase 5D metrics.jsonl fallback. Modal
+# containers have a writable /tmp; the repo path used locally does not exist in
+# the image.
+WORKER_LOG_DIR = "/tmp/voice_pipeline_logs"
+
+# Add wandb secret if available (optional).
+# Phase 5D: a missing W&B secret is no longer a silent pass. The session still
+# runs (metrics go to metrics.jsonl in WORKER_LOG_DIR), but the reason is
+# recorded at ERROR so a blank dashboard is traceable to this line.
 try:
     SECRETS.append(modal.Secret.from_name("wandb-credentials"))
-except Exception:
-    pass
+except Exception as exc:  # noqa: BLE001 - deploy must not fail on optional secret
+    print(
+        "ERROR: W&B secret 'wandb-credentials' unavailable "
+        f"({exc}). Voice metrics will fall back to {WORKER_LOG_DIR}/<session>/metrics.jsonl"
+    )
 
 
 # ============================================================================
@@ -91,6 +102,8 @@ def voice_worker_for_room(
     worker_env["VOICE_PIPELINE_LOG_TO_FILE"] = "0"
     worker_env["VOICE_SESSION_ID"] = session_id
     worker_env["PYTHONUNBUFFERED"] = "1"
+    # Phase 5D: session log directory for the metrics.jsonl W&B fallback.
+    worker_env["VOICE_PIPELINE_LOG_DIR"] = WORKER_LOG_DIR
 
     # ``connect`` is LiveKit's single-session mode. Unlike ``start``, it
     # connects this on-demand Modal function directly to the requested room

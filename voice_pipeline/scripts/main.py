@@ -54,6 +54,8 @@ from voice_pipeline.utils.metrics import (
     RAGMetricsReporter,
 )
 from voice_pipeline.utils.wandb_logger import WandbLogger
+from voice_pipeline.utils.prefetch import PrefetchScheduler
+from voice_pipeline.utils.reconnect import reconnect_with_backoff
 
 from voice_pipeline.utils.logger import setup_logging
 
@@ -106,7 +108,11 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return raw_value in {"1", "true", "yes", "on"}
 
 
-VOICE_PIPELINE_LOG_DIR = PROJECT_ROOT / "logs" / "voice_pipeline"
+# Honour VOICE_PIPELINE_LOG_DIR when the deployment sets it (Modal points it
+# at a writable path); fall back to the repo-local directory for local runs.
+VOICE_PIPELINE_LOG_DIR = Path(
+    os.getenv("VOICE_PIPELINE_LOG_DIR") or PROJECT_ROOT / "logs" / "voice_pipeline"
+)
 setup_logging(
     level=os.getenv("VOICE_PIPELINE_LOG_LEVEL"),
     to_file=_env_flag("VOICE_PIPELINE_LOG_TO_FILE"),
@@ -327,6 +333,18 @@ class BackendClient:
                 await _asyncio.sleep(backoff)
         # Unreachable, but keeps type-checkers quiet.
         raise RuntimeError(f"post_with_retry exited unexpectedly: {last_exc}")
+
+    async def prefetch(self, query: str, top_k: int = 3, timeout: float = 3.0) -> dict:
+        """Warm the backend retrieval cache for ``query`` (Phase 5B).
+
+        Deliberately thin: one short-timeout POST, no retries, no idempotency
+        key (retrieval is read-only). Failures are the caller's to ignore.
+        """
+        return await self.post(
+            "/api/rag/prefetch",
+            {"query": query, "top_k": top_k},
+            timeout=timeout,
+        )
 
     async def health_check(self) -> bool:
         """Check if backend is reachable."""
@@ -617,6 +635,10 @@ class VoiceAgent(Agent):
                 # and use Groq (Phase 1D/1E). Chat keeps the Mercury default.
                 "max_tokens": 256,
                 "generation_backend": "groq",
+                # Phase 5A: short, markdown-free prompt built for TTS. The
+                # retrieval cache is keyed independently of the template, so a
+                # prefetch fired on a partial transcript still warms this call.
+                "template_key": "voice_prompt",
             }
             # Phase 2B/2C: consume the SSE endpoint with a 10s wall-clock
             # budget. collect_stream never raises, so the voice turn cannot
@@ -938,7 +960,8 @@ async def entrypoint(ctx: JobContext):
     4. Start voice session
     """
     session_id = os.getenv("VOICE_SESSION_ID") or uuid.uuid4().hex
-    wandb_logger = WandbLogger(session_id=session_id)
+    # Phase 5D: log_dir is where metrics.jsonl lands when W&B is unavailable.
+    wandb_logger = WandbLogger(session_id=session_id, log_dir=VOICE_PIPELINE_LOG_DIR)
     
     logger.info(f"🎯 Starting voice session: {session_id}")
 
@@ -1028,6 +1051,99 @@ async def entrypoint(ctx: JobContext):
             **audio_kwargs,
         )
 
+    # ---------------------------------------------------------------- #
+    # Phase 5B: warm RAG retrieval while the user is still speaking.
+    # ---------------------------------------------------------------- #
+    async def _send_prefetch(text: str) -> None:
+        await agent.backend.prefetch(text, top_k=3, timeout=3.0)
+
+    prefetch_scheduler = PrefetchScheduler(_send_prefetch)
+
+    def _on_user_transcript(ev: Any) -> None:
+        """Fire-and-forget prefetch on partial transcripts.
+
+        Runs on the session's event callback, so it must not await anything:
+        PrefetchScheduler.on_partial only schedules a task. A final transcript
+        cancels any still-pending prefetch, because the real turn is already
+        under way and a warm-up at that point is wasted work.
+        """
+        try:
+            transcript = getattr(ev, "transcript", "") or ""
+            is_final = bool(getattr(ev, "is_final", False))
+            if is_final:
+                prefetch_scheduler.cancel_pending()
+                return
+            prefetch_scheduler.on_partial(transcript)
+        except Exception:  # noqa: BLE001 - never let a warm-up break a turn
+            logger.exception("Partial transcript prefetch hook failed")
+
+    try:
+        session.on("user_input_transcribed", _on_user_transcript)
+    except Exception:  # noqa: BLE001 - older livekit builds may not emit it
+        logger.warning(
+            "Could not subscribe to user_input_transcribed; "
+            "RAG prefetch on partial transcripts is disabled"
+        )
+
+    # ---------------------------------------------------------------- #
+    # Phase 5C: bounded reconnect on a non-recoverable session error.
+    #
+    # Ladder is 1s / 2s / 4s, so the worst case (three failures plus the
+    # apology) is ~7s. The WORKER_HEARTBEAT task is deliberately left running
+    # throughout: cancelling it here would trip the Modal supervisor's
+    # heartbeat watchdog and kill the worker mid-recovery.
+    # ---------------------------------------------------------------- #
+    reconnect_task: Optional[_asyncio.Task] = None
+
+    async def _reconnect_once(attempt: int) -> None:
+        logger.warning("Reconnecting voice session (attempt %d)", attempt)
+        await ctx.connect()
+        room = getattr(ctx, "room", None)
+        state = getattr(room, "connection_state", None)
+        if state is not None and "conn" not in str(state).lower():
+            raise RuntimeError(f"room still not connected (state={state})")
+
+    async def _announce_session_ended() -> None:
+        await session.say(
+            "I'm sorry, this session ended unexpectedly. "
+            "Please start a new session and I'll pick up from there.",
+            allow_interruptions=False,
+        )
+
+    async def _run_reconnect() -> None:
+        recovered = await reconnect_with_backoff(
+            _reconnect_once,
+            max_attempts=3,
+            base_delay=1.0,
+            on_give_up=_announce_session_ended,
+            log=logger,
+        )
+        if recovered:
+            try:
+                session.say(
+                    "Thanks for waiting, I'm back.", allow_interruptions=True
+                )
+            except Exception:
+                logger.exception("Failed to announce successful reconnect")
+            return
+
+        _voice_error_inc("livekit")
+        _ensure_cleanup_task()
+
+        shutdown_job = getattr(ctx, "shutdown", None)
+        if callable(shutdown_job):
+            try:
+                shutdown_job(reason="Voice session reconnect exhausted")
+            except Exception:
+                logger.exception("Failed to request LiveKit job shutdown")
+
+    def _start_reconnect() -> None:
+        nonlocal reconnect_task
+        if reconnect_task is not None and not reconnect_task.done():
+            logger.info("Reconnect already in progress; ignoring duplicate error")
+            return
+        reconnect_task = _asyncio.create_task(_run_reconnect())
+
     @session.on("error")
     def on_error(ev: ErrorEvent) -> None:
         err = getattr(ev, "error", None)
@@ -1066,13 +1182,16 @@ async def entrypoint(ctx: JobContext):
                 logger.exception("Failed to restart STT")
             return
 
+        # Non-recoverable and not attributable to a media component: the room
+        # connection itself is suspect, so tell the user and try to reconnect.
         _play_unavailable_prompt()
+        _start_reconnect()
 
     heartbeat_task: Optional[_asyncio.Task] = None
     cleanup_task: Optional[_asyncio.Task] = None
 
     async def _cleanup_resources() -> None:
-        nonlocal heartbeat_task
+        nonlocal heartbeat_task, reconnect_task
 
         task = heartbeat_task
         heartbeat_task = None
@@ -1085,6 +1204,27 @@ async def entrypoint(ctx: JobContext):
                 pass
             except Exception:
                 logger.exception("Worker heartbeat task failed")
+
+        # Phase 5C: stop any in-flight reconnect. Guarded against self-cancel,
+        # since the give-up path schedules this cleanup from inside that task.
+        pending_reconnect = reconnect_task
+        reconnect_task = None
+        current = _asyncio.current_task()
+        if pending_reconnect is not None and pending_reconnect is not current:
+            if not pending_reconnect.done():
+                pending_reconnect.cancel()
+            try:
+                await pending_reconnect
+            except _asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Reconnect task failed")
+
+        # Phase 5B: drop any queued prefetch so it cannot outlive the session.
+        try:
+            await prefetch_scheduler.aclose()
+        except Exception:
+            logger.exception("Failed to close prefetch scheduler")
 
         try:
             await agent.backend.close()
