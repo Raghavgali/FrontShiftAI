@@ -1,0 +1,78 @@
+# Root build context ignore rules.
+#
+# This file applies to every image built from the repository root, which today
+# means Dockerfile.backend and Dockerfile.frontend. Keep it conservative:
+# Dockerfile.frontend copies "frontend/" from this same context, so the
+# frontend source tree must stay visible here. Only build output and
+# dependency caches are dropped.
+#
+# IMPORTANT: data_pipeline/data/vector_db/ MUST remain in the context.
+# The backend serves RAG queries straight out of that git-tracked Chroma
+# store, and ensure_chroma_store() early-returns when the directory is
+# present. If the vector store is missing from the image, production startup
+# fails. Every exclusion under data_pipeline/data below is listed explicitly,
+# one directory at a time, rather than using a wildcard plus a re-include, so
+# that vector_db can never be swept up by accident.
+
+# --- Version control and tooling metadata ---
+.git
+.gitignore
+.github
+.dockerignore
+.DS_Store
+**/.DS_Store
+.vscode
+.idea
+.claude
+CLAUDE.md
+
+# --- Python virtualenvs and caches ---
+backend/backend_venv
+**/venv
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+htmlcov
+.coverage
+**/.coverage
+
+# --- Node dependencies and build output ---
+**/node_modules
+frontend*/dist
+frontend*/.vite
+
+# --- Local databases (production uses Neon Postgres) ---
+**/*.db
+**/*.db-journal
+**/*.sqlite
+**/*.sqlite3-journal
+
+# --- Experiment tracking / analysis artifacts ---
+wandb
+**/wandb
+graphify-out
+mlruns
+outputs
+
+# --- data_pipeline/data: drop every intermediate stage, KEEP vector_db ---
+data_pipeline/data/raw
+data_pipeline/data/parsed
+data_pipeline/data/cleaned
+data_pipeline/data/chunked
+data_pipeline/data/validated
+data_pipeline/data/bias_analysis
+data_pipeline/data/chroma_db.tar.gz
+
+# Airflow local state (never needed at serving time)
+data_pipeline/airflow/logs
+data_pipeline/airflow/airflow.db
+
+# Defensive re-include: if any pattern above ever widens to match the vector
+# store, this line pulls it back into the context.
+!data_pipeline/data/vector_db
+!data_pipeline/data/vector_db/**

@@ -8,6 +8,26 @@ RUN apt-get update && apt-get install -y \
   g++ \
   && rm -rf /var/lib/apt/lists/*
 
+# Install CPU-only torch BEFORE the rest of the requirements.
+#
+# backend/requirements.txt asks for sentence-transformers without pinning
+# torch, so on linux/amd64 plain PyPI resolves to the default CUDA build and
+# drags in several GB of nvidia-* wheels. This service never touches a GPU:
+# the embedding model is all-MiniLM-L6-v2 on CPU, the cross-encoder reranker
+# is disabled (chat_pipeline/configs/rag.yaml pipeline.reranker.enabled:
+# false), and every generation model is a remote API.
+#
+# The PyTorch CPU index is primary so that "torch" resolves to a +cpu wheel,
+# with PyPI kept as an extra index for torch's pure-python dependencies
+# (filelock, sympy, networkx, jinja2, fsspec, typing-extensions). Installing
+# torch first means the later requirements install sees it already satisfied
+# and leaves it alone. requirements.txt itself is untouched, so local macOS
+# installs keep working exactly as before (macOS has no CUDA wheels anyway).
+RUN pip install --no-cache-dir --user \
+  --index-url https://download.pytorch.org/whl/cpu \
+  --extra-index-url https://pypi.org/simple \
+  torch
+
 # Copy backend requirements and install
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
@@ -20,14 +40,24 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 FROM python:3.12-slim
 WORKDIR /app
 
-# Install runtime dependencies and gsutil
-RUN apt-get update && apt-get install -y \
+# Install runtime dependencies.
+#
+# curl is required by the HEALTHCHECK below, so it must stay.
+#
+# The full google-cloud-cli package used to be installed here purely to get
+# gsutil. It is deliberately gone now: the vector store is baked into the
+# image (see .dockerignore) and ensure_chroma_store() early-returns when the
+# directory already exists, so the gsutil download path in
+# chat_pipeline/rag/data_loader.py is unreachable in this image.
+#
+# NOTE for a future Celery worker image: backend/jobs/tasks.py and
+# chat_pipeline/tracking/{deploy_model,rollback_model}.py do shell out to
+# gsutil. None of those run in this web-serving container (Celery and Redis
+# are not provisioned on Cloud Run), but a dedicated worker image built from
+# this repo WILL need the Cloud SDK installed and will need to reinstate an
+# apt install of google-cloud-cli.
+RUN apt-get update && apt-get install -y --no-install-recommends \
   curl \
-  gnupg \
-  lsb-release \
-  && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list \
-  && curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
-  && apt-get update && apt-get install -y google-cloud-cli \
   && rm -rf /var/lib/apt/lists/*
 
 # Copy Python packages from builder
