@@ -4,10 +4,12 @@ Reads validated chunks from data/validated/valid_chunks.jsonl
 and stores embeddings into data/vector_db/.
 """
 
+import hashlib
 import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Sequence, Tuple
 
 import chromadb
 import pandas as pd
@@ -40,6 +42,120 @@ if not logger.handlers:
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
 
+# Chroma embeds every document in the call, so one giant add() is a single
+# all-or-nothing unit of work whose failure leaves the store in an unknown
+# state. 500 keeps each unit small enough to report on.
+BATCH_SIZE = 500
+
+
+class BatchWriteError(RuntimeError):
+    """A batch insert failed. Carries the batches that did land."""
+
+    def __init__(self, message: str, succeeded_batches: Sequence[int], written: int):
+        super().__init__(message)
+        self.succeeded_batches = list(succeeded_batches)
+        self.written = written
+
+
+def chunk_dedupe_key(chunk: Dict[str, Any]) -> str:
+    """Stable identity for a chunk.
+
+    Prefers the ``hash_64`` produced upstream by the chunker. Falls back to a
+    digest of the text so chunks missing a hash are still deduplicated instead
+    of all colliding on the empty string.
+    """
+    existing = chunk.get("hash")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    text = chunk.get("text") or ""
+    return "sha256:" + hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
+def dedupe_chunks(chunks: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """Drop repeated chunks, keeping first occurrence order.
+
+    Returns ``(unique_chunks, dropped_count)``.
+    """
+    seen = set()
+    unique: List[Dict[str, Any]] = []
+    dropped = 0
+    for chunk in chunks:
+        key = chunk_dedupe_key(chunk)
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        unique.append(chunk)
+    return unique, dropped
+
+
+def add_in_batches(
+    collection,
+    documents: Sequence[str],
+    metadatas: Sequence[Dict[str, Any]],
+    ids: Sequence[str],
+    batch_size: int = BATCH_SIZE,
+) -> List[int]:
+    """Insert in bounded batches, logging each one that lands.
+
+    Returns the 1-indexed batch numbers that succeeded. Raises
+    ``BatchWriteError`` naming the last good batch, so a failed run says
+    exactly how far it got instead of leaving an opaque partial collection.
+    """
+    total = len(documents)
+    if not (total == len(metadatas) == len(ids)):
+        raise ValueError(
+            f"documents/metadatas/ids length mismatch: "
+            f"{total}/{len(metadatas)}/{len(ids)}"
+        )
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+    batch_count = (total + batch_size - 1) // batch_size
+    succeeded: List[int] = []
+    written = 0
+
+    for batch_number, start in enumerate(range(0, total, batch_size), start=1):
+        end = min(start + batch_size, total)
+        try:
+            collection.add(
+                documents=list(documents[start:end]),
+                metadatas=list(metadatas[start:end]),
+                ids=list(ids[start:end]),
+            )
+        except Exception as exc:
+            logger.error(
+                "❌ Batch %d/%d (rows %d-%d) failed: %s. Batches that succeeded: %s",
+                batch_number,
+                batch_count,
+                start,
+                end - 1,
+                exc,
+                succeeded or "none",
+            )
+            raise BatchWriteError(
+                f"Batch {batch_number}/{batch_count} (rows {start}-{end - 1}) failed: "
+                f"{exc}. Succeeded batches: {succeeded or 'none'} "
+                f"({written} of {total} chunks stored).",
+                succeeded,
+                written,
+            ) from exc
+
+        succeeded.append(batch_number)
+        written += end - start
+        logger.info(
+            "✅ Batch %d/%d stored (rows %d-%d, %d/%d chunks total).",
+            batch_number,
+            batch_count,
+            start,
+            end - 1,
+            written,
+            total,
+        )
+
+    return succeeded
+
+
 def main():
     logger.info("🚀 Starting embedding and ChromaDB storage pipeline...")
 
@@ -70,8 +186,18 @@ def main():
                 except json.JSONDecodeError:
                     logger.warning("⚠️ Skipping invalid JSON line in valid_chunks.jsonl")
 
+        logger.info(f"✅ Loaded {len(all_chunks)} valid chunks for embedding.")
+
+        # --- Deduplicate before embedding ---
+        # Embedding is the expensive step, so duplicates are dropped first.
+        all_chunks, dropped = dedupe_chunks(all_chunks)
+        if dropped:
+            logger.warning(
+                f"🧽 Dropped {dropped} duplicate chunk(s); "
+                f"{len(all_chunks)} unique chunks remain."
+            )
+
         df = pd.DataFrame(all_chunks)
-        logger.info(f"✅ Loaded {len(df)} valid chunks for embedding.")
 
         if df.empty:
             raise ValueError("No valid chunks found in file. Check validation output.")
@@ -106,11 +232,17 @@ def main():
         elif len(documents) < 10:
             logger.warning(f"Only {len(documents)} chunks detected. Possible small dataset.")
 
-        # --- Add to ChromaDB ---
-        logger.info(f"🧠 Adding {len(documents)} chunks to ChromaDB collection '{collection_name}'...")
-        collection.add(documents=documents, metadatas=metadatas, ids=ids)
+        # --- Add to ChromaDB in bounded batches ---
+        logger.info(
+            f"🧠 Adding {len(documents)} chunks to ChromaDB collection "
+            f"'{collection_name}' in batches of {BATCH_SIZE}..."
+        )
+        succeeded = add_in_batches(collection, documents, metadatas, ids)
 
-        logger.info(f"💾 Stored {len(documents)} embeddings in collection '{collection_name}'.")
+        logger.info(
+            f"💾 Stored {len(documents)} embeddings in collection "
+            f"'{collection_name}' across {len(succeeded)} batch(es)."
+        )
         logger.info(f"📂 Vector DB saved at: {VECTOR_DB_PATH}")
 
     except Exception as e:

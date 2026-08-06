@@ -48,6 +48,9 @@ keys/
 data_pipeline/logs/
 logs/
 
+# Data pipeline checkpoint markers (run state, not source)
+data_pipeline/.pipeline_state/
+
 # Data 
 /data/
 
