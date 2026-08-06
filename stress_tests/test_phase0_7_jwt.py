@@ -74,6 +74,12 @@ def test_logout_revokes_refresh():
 
 def test_expired_access_token_rejected():
     from jwt import encode
+    # This test needs a live backend as well as the signing secret. Gate on
+    # the same env as the rest of the file: importing anything that calls
+    # load_dotenv() puts JWT_SECRET_KEY on os.environ, so the secret alone is
+    # not evidence that there is a deployment to talk to.
+    if not (LOGIN_EMAIL and LOGIN_PASSWORD):
+        pytest.skip("Set STRESS_TEST_LOGIN_EMAIL/PASSWORD for 0.7 tests")
     secret = os.getenv("JWT_SECRET_KEY")
     if not secret:
         pytest.skip("Set JWT_SECRET_KEY to sign an expired token for this test")
