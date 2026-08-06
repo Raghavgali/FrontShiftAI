@@ -1,6 +1,20 @@
 backend:
-  url: "https://frontshiftai-backend-vvukpmzsxa-uc.a.run.app/"
-  token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBncm91cDkuY29tIiwiY29tcGFueSI6IkZyb250U2hpZnRBSSIsInJvbGUiOiJzdXBlcl9hZG1pbiIsImV4cCI6MTc5NjYwMzc4OX0.jx2ENerr9YQArLah_rXBT8XtGBpQz846ws2ZR0mhnmI"
+  # Both values are supplied at runtime and must never be committed.
+  #
+  #   url   -> VOICE_AGENT_BACKEND_URL, the Cloud Run backend base URL
+  #   token -> VOICE_AGENT_JWT, a backend-issued JWT, provided as a Modal
+  #            secret when the voice agent is deployed
+  #
+  # voice_pipeline/utils/config.py reads those environment variables first and
+  # only falls back to the keys below. They are deliberately left empty: with
+  # nothing in the environment, load_voice_config() raises a clear ValueError
+  # at config.py:97-100 instead of silently talking to the wrong backend.
+  #
+  # A previous revision of this file hardcoded a super-admin JWT for a
+  # university group project. That token and backend are both dead, and the
+  # token should be treated as compromised since it is in git history.
+  url: ""
+  token: ""
 
 livekit:
   stt:

@@ -21,13 +21,29 @@ import uvicorn
 # Load environment variables
 load_dotenv(dotenv_path=Path(__file__).parent / "scripts" / ".env")
 
-# LiveKit credentials
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "wss://frontshiftai-vkrebx4e.livekit.cloud")
+# LiveKit credentials. All three come from the environment with no defaults:
+# LIVEKIT_URL used to fall back to a university group project's LiveKit Cloud
+# instance, which meant a missing variable silently pointed clients at someone
+# else's server instead of failing.
+LIVEKIT_URL = os.getenv("LIVEKIT_URL")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 
-if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
-    raise ValueError("LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be set in environment")
+_missing = [
+    name
+    for name, value in (
+        ("LIVEKIT_URL", LIVEKIT_URL),
+        ("LIVEKIT_API_KEY", LIVEKIT_API_KEY),
+        ("LIVEKIT_API_SECRET", LIVEKIT_API_SECRET),
+    )
+    if not value
+]
+if _missing:
+    raise ValueError(
+        f"Missing required environment variable(s): {', '.join(_missing)}. "
+        "Set them in voice_pipeline/scripts/.env or the shell environment. "
+        "LIVEKIT_URL looks like wss://<your-project>.livekit.cloud"
+    )
 
 # Import LiveKit API for token generation
 from livekit import api
