@@ -16,19 +16,38 @@ import pytest
 # ---- 0A: SQLite fallback blocked in production -----------------------------
 
 def test_sqlite_fallback_blocked_in_production(monkeypatch):
-    """In ENVIRONMENT=production, unreachable PostgreSQL must raise, not fall back."""
-    monkeypatch.setenv("ENVIRONMENT", "production")
-    monkeypatch.setenv(
-        "DATABASE_URL",
-        "postgresql://invalid:invalid@127.0.0.1:1/nonexistent",
-    )
-    # Import lazily so the env override takes effect before module import caches.
-    import importlib
-    import backend.db.connection as connection
-    importlib.reload(connection)
+    """In ENVIRONMENT=production, SQLite must never be chosen.
 
-    with pytest.raises(RuntimeError, match="PostgreSQL required"):
-        connection.get_database_url()
+    Phase 6C removed the hardcoded local PostgreSQL probe, so there are now
+    two ways to reach production: DATABASE_URL is supplied and used verbatim,
+    or it is absent, which is a configuration error. Neither may fall back to
+    SQLite, which is ephemeral on Cloud Run.
+    """
+    import importlib
+
+    # Import once in a safe state. Whether this module is already in
+    # sys.modules depends on collection order, and importing it for the first
+    # time under production env would raise before the assertion below.
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///./test_phase0_probe.db")
+    import backend.db.connection as connection
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("LOCAL_POSTGRES_URL", raising=False)
+
+    # The module resolves DATABASE_URL at import time, so a production import
+    # with nothing configured must fail there rather than quietly binding an
+    # engine to a SQLite file.
+    with pytest.raises(RuntimeError, match="DATABASE_URL must be set"):
+        importlib.reload(connection)
+
+    # An unreachable PostgreSQL URL is used as given, never swapped for SQLite.
+    unreachable = "postgresql://invalid:invalid@127.0.0.1:1/nonexistent"
+    monkeypatch.setenv("DATABASE_URL", unreachable)
+    importlib.reload(connection)
+    assert connection.DATABASE_URL == unreachable
+    assert not connection.DATABASE_URL.startswith("sqlite")
 
 
 # ---- 0C: health check connection leak --------------------------------------

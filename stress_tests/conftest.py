@@ -10,11 +10,26 @@ from __future__ import annotations
 
 import os
 import statistics
+import sys
+from pathlib import Path
 from typing import List
 
 import httpx
 import pytest
 import pytest_asyncio
+
+# pytest puts stress_tests/ on sys.path, not the repo root, so `import
+# backend.db...` only worked when some earlier test file happened to add the
+# root first. That made at least one test pass or fail depending on
+# collection order. Add it once, here.
+#
+# backend/ is needed too: the app runs with backend/ as its working
+# directory, so its own modules import each other as top-level (`from
+# db.connection import ...`), and backend/db/__init__.py does exactly that.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "backend")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 BACKEND_URL = os.getenv("STRESS_TEST_BACKEND_URL", "http://localhost:8000")
 JWT_TOKEN = os.getenv("STRESS_TEST_JWT")
