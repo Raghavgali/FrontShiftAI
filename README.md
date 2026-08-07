@@ -30,12 +30,14 @@ Unlike standard chatbots, FrontShiftAI operates as a **Multi-Tenant System of Ag
 | Component | Provider | URL |
 |-----------|----------|-----|
 | **Landing Page** | **GitHub Pages** (live) | [https://raghavgali.github.io/FrontShiftAI/](https://raghavgali.github.io/FrontShiftAI/) |
-| **Backend API** | Cloud Run | Redeployment under this fork's own GCP project is in progress |
+| **Backend API** | Cloud Run + Neon Postgres | Redeployment under this fork's own GCP project is in progress |
 | **Voice Agent** | Modal | Deployed from `voice_pipeline/modal_deploy.py` (scale-to-zero) |
 
 The original capstone deployments (Vercel + the group's GCP project) belonged
 to the team infrastructure and are being migrated to accounts owned by this
-fork; links here are updated as each piece comes online.
+fork; links here are updated as each piece comes online. See
+[`deployment/go_live.sh`](./deployment/go_live.sh) for the script that brings
+the backend up.
 
 ---
 
@@ -204,7 +206,7 @@ For a detailed breakdown of all resources, see the [Deployment Guide](./deployme
 | Component | Service | Role |
 |-----------|---------|------|
 | **Compute** | **Cloud Run** | Runs the Backend (FastAPI) and Frontend (React/Nginx) containers. Scales to zero to minimize costs. |
-| **Database** | **Cloud SQL** | Managed PostgreSQL 15 instance storing user data, PTO requests, ticket queues, and relational state. |
+| **Database** | **Neon** | Serverless managed PostgreSQL storing user data, PTO requests, ticket queues, LangGraph checkpoints, and relational state. Replaced Cloud SQL, which bills for an always-on instance whether or not anyone visits. |
 | **Vector Store** | **ChromaDB + GCS** | Local vector database loaded into memory from Google Cloud Storage on container startup. |
 | **Security** | **Secret Manager** | Injects API keys (`GROQ`, `MERCURY`) and DB credentials at runtime. |
 | **Backups** | **Automated** | Daily backups of SQL data (3 AM UTC); Immutable artifact versioning for Vector DBs. |
@@ -241,7 +243,7 @@ For a detailed breakdown of all resources, see the [Deployment Guide](./deployme
 ### DevOps & Infrastructure
 - **Containerization**: Docker (Multi-stage builds)
 - **CI/CD**: GitHub Actions (Workload Identity Federation)
-- **Cloud**: GCP (Cloud Run, Cloud SQL, GCS, Secret Manager)
+- **Cloud**: GCP (Cloud Run, GCS, Secret Manager) + Neon (serverless Postgres)
 
 ---
 
@@ -298,11 +300,11 @@ Designed for student-budget constraints (Free Tier capable).
 
 | Service | Configuration | Est. Monthly Cost |
 |---------|---------------|-------------------|
-| **Cloud SQL** | `db-f1-micro` | ~$10.00 |
+| **Neon Postgres** | Free tier | $0.00 |
 | **Cloud Run** | Scale-to-Zero | ~$2.00 |
 | **Cloud Storage** | Standard (<1GB) | < $0.10 |
 | **LLM APIs** | Groq/Mercury (Free Tiers) | $0.00 |
-| **Total** | | **~$12.10** |
+| **Total** | | **~$2.10** |
 
 ---
 
@@ -369,8 +371,10 @@ Status as of this README:
 | **1 — Quick Wins: Latency + Resilience** | Persistent pooled HTTP client in voice `BackendClient`, silero VAD tuned (0.3s silence / 0.1s speech), tool timeouts cut (RAG 8s, others 10s), per-request `max_tokens` + `generation_backend` through schema → pipeline → generator, voice uses Groq at 256 tokens | ✅ Implemented |
 | **2 — Streaming (SSE)** | Token-level streaming from Groq/Mercury/OpenAI, `POST /api/rag/query/stream` (sources/token/done events), PTO + HR agent `/chat/stream` with per-node status events, voice agent consumes streams with 10s budget + partial-answer fallback + idempotency-keyed batch retry, frontend fetch-stream client | ✅ Implemented |
 | **3 — Infrastructure Resilience** | Supervised Modal voice worker (bounded restarts + 60s heartbeat watchdog, single-room `connect` mode), post-deploy health gate polling `/health/ready` with automatic rollback to the previous Cloud Run revision, shutdown drain of in-flight requests. 3A (keep_warm) deliberately skipped: scale-to-zero is the accepted cost posture, so the first request of the day may cold-start and the warm path is what gets asserted | ✅ Implemented |
-| **4–5 — Caching, Voice Fast Path** | TTL caching, GCS sync retry, pipeline checkpointing, voice prefetch on partial STT | ⏳ Up next |
-| **5.5 — Durable LangGraph Checkpointing** | `PostgresSaver` checkpointer for multi-turn resume + admin-approval workflows | ⏳ Deferred |
+| **4 — Caching + Data Pipeline Resilience** | Lock-guarded bounded LRU for the company filter and company list (the previous `lru_cache` on the Chroma `Collection` raised `TypeError` on every call because the object is unhashable, which had killed the dynamic-lookup and `$contains` fallback paths); GCS sync and Chroma archive download retry 3 times at 5s/10s/20s with integrity verification; data pipeline stages write checkpoint markers with `--resume`; PDF downloads are atomic with partial-file cleanup; Chroma writes are deduplicated by hash and batched at 500 with per-batch success logging | ✅ Implemented |
+| **5 — Voice Fast Path + Voice Pipeline Resilience** | `voice_prompt` template with `template_key` threaded through schema, pipeline and generator; `POST /api/rag/prefetch` retrieval-only endpoint backed by a separate retrieval cache keyed without generation settings, warmed from partial STT transcripts; session reconnect on a fixed 1s/2s/4s ladder that stays inside the Modal supervisor's 60s heartbeat watchdog; W&B outage falls back to `metrics.jsonl`; PTO keywords checked before the HR fallback in intent detection | ✅ Implemented |
+| **5.5 — Durable LangGraph Checkpointing** | Checkpointer implemented directly on the existing SQLAlchemy engine rather than adopting `langgraph-checkpoint-postgres` (the async saver pins a singleton to one event loop, wants a second connection pool, and uses `prepare_threshold=0`, which breaks against Neon's pgbouncer transaction-mode endpoint); dialect ladder degrades to `MemorySaver` rather than crashing, with `CHECKPOINTER_BACKEND=off` as a kill switch; tenant guard enforced at the saver using SQLAlchemy Core, since an ORM query would be narrowed by the Phase 0.6 listener and a cross-tenant thread would read as "not found" and be allowed; daily cleanup of checkpoints for conversations untouched for 30 days | ✅ Implemented |
+| **6 — Observability & Circuit Breakers** | Request correlation IDs propagated via a logging record factory (the previous root-logger filter never fired for module loggers, so `%(request_id)s` raised for every real log line); LLM providers circuit-broken through the existing Phase 6.5 policy matrix rather than a second breaker implementation, so a dead Mercury stops costing the full retry budget before falling through to Groq; `NullPool` replaced with `QueuePool(5, 10)` for PostgreSQL with dialect-specific branching for SQLite | ✅ Implemented |
 
 Tests for completed phases live in [`stress_tests/`](./stress_tests/); policy docs in [`docs/resilience_policy.md`](./docs/resilience_policy.md) and [`docs/resilience_audit.md`](./docs/resilience_audit.md).
 
