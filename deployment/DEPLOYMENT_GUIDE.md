@@ -2,12 +2,14 @@
 
 This guide explains how to deploy the FrontShiftAI application to Google Cloud Platform (GCP) from scratch. It is designed for developers who want to set up their own instance of the application.
 
+> **Recommended path**: run the interactive wizard, `./deployment/go_live.sh` (documented in `deployment/GO_LIVE.md`), which automates everything below. This guide is the manual fallback and a reference for what the wizard does under the hood.
+
 ## Prerequisites
 
 1.  **GCP Account**: A Google Cloud Platform account with billing enabled.
 2.  **Domain Name (Optional)**: For custom domains (Cloud Run provides default URLs).
 3.  **Third-Party API Keys**:
-    - [Mercury Labs](https://mercurylabs.org/) (LLM)
+    - [Inception Labs](https://platform.inceptionlabs.ai/) (Mercury LLM, read as `INCEPTION_API_KEY`; the API base `chat_pipeline/rag/generator.py` defaults to is `https://api.inceptionlabs.ai/v1`)
     - [Groq](https://groq.com/) (Fallback LLM)
     - [Brave Search](https://brave.com/search/api/) (Web extraction)
     - [HuggingFace](https://huggingface.co/) (Embedding models)
@@ -21,21 +23,25 @@ This guide explains how to deploy the FrontShiftAI application to Google Cloud P
 ## Step 1: GCP Project Setup
 
 1.  **Create a Project**:
+
+    > **Warning**: `YOUR_PROJECT_ID` must be a new, globally unique id across all of Google Cloud. Do not reuse the old `frontshiftai` or `frontshiftai-deploy` project ids; they belong to a retired project and cannot be reused.
+
     ```bash
-    gcloud projects create frontshiftai-deploy --name="FrontShiftAI Deploy"
-    gcloud config set project frontshiftai-deploy
+    gcloud projects create YOUR_PROJECT_ID --name="FrontShiftAI Deploy"
+    gcloud config set project YOUR_PROJECT_ID
     ```
 
 2.  **Enable Required APIs**:
     ```bash
     gcloud services enable \
       run.googleapis.com \
-      sqladmin.googleapis.com \
-      storage.googleapis.com \
       artifactregistry.googleapis.com \
       secretmanager.googleapis.com \
       iamcredentials.googleapis.com \
-      cloudbuild.googleapis.com
+      iam.googleapis.com \
+      sts.googleapis.com \
+      cloudresourcemanager.googleapis.com \
+      compute.googleapis.com
     ```
 
 ---
@@ -43,49 +49,29 @@ This guide explains how to deploy the FrontShiftAI application to Google Cloud P
 ## Step 2: Infrastructure Setup
 
 ### 1. Artifact Registry (Docker Images)
-Create repositories for backend and frontend images.
+Create the repository for the backend image.
 
 ```bash
 gcloud artifacts repositories create frontshiftai-backend \
     --repository-format=docker \
     --location=us-central1 \
     --description="Backend Docker repository"
-
-gcloud artifacts repositories create frontshiftai-frontend \
-    --repository-format=docker \
-    --location=us-central1 \
-    --description="Frontend Docker repository"
 ```
 
-### 2. Cloud Storage (Data & Vectors)
-Create a bucket for data and upload the ChromaDB vector store.
+> **Legacy / not needed**: a `frontshiftai-frontend` Artifact Registry repository is no longer required. The frontend and landing page are deployed to GitHub Pages (see Step 4), not Cloud Run or Docker.
 
-```bash
-# Create bucket
-gsutil mb -l us-central1 gs://frontshiftai-deploy-data
+### 2. Cloud Storage (Data & Vectors): legacy, not needed
+Older versions of this guide had you package the ChromaDB vector store into a tar.gz, upload it to a Cloud Storage bucket, and download it at container start. That is no longer necessary: the Chroma store now ships baked into the backend Docker image (`Dockerfile.backend` copies `data_pipeline/`), and `chat_pipeline/rag/data_loader.py:ensure_chroma_store()` returns immediately when the store is already present locally. You can skip this step entirely.
 
-# Upload ChromaDB (packaged from your local data pipeline)
-# Assuming you have the tar.gz locally
-gsutil cp path/to/chroma_db.tar.gz gs://frontshiftai-deploy-data/chroma_db.tar.gz
-```
+### 3. Neon (Database)
+Create a free serverless Postgres database with [Neon](https://neon.tech/):
 
-### 3. Cloud SQL (Database)
-Create a PostgreSQL instance.
-
-```bash
-# Create instance
-gcloud sql instances create frontshiftai-db \
-    --database-version=POSTGRES_15 \
-    --tier=db-f1-micro \
-    --region=us-central1 \
-    --root-password=YourStrongPassword123
-
-# Create database
-gcloud sql databases create frontshiftai --instance=frontshiftai-db
-```
+1.  Sign up and create a new Neon project in the browser.
+2.  Copy the connection string Neon gives you. Prefer the pooled connection (the host with the `-pooler` suffix), and keep `sslmode=require` in the URL.
+3.  Store that connection string verbatim as the `DATABASE_URL` secret in Step 4 below. No further setup, instance sizing, or IAM roles are required.
 
 ### 4. Secret Manager (Configuration)
-Store sensitive keys safely.
+Store sensitive keys safely. These are the five secrets the deploy workflow mounts:
 
 ```bash
 # Create and set secrets (repeat for each key)
@@ -93,11 +79,12 @@ echo -n "your-mercury-key" | gcloud secrets create INCEPTION_API_KEY --data-file
 echo -n "your-groq-key" | gcloud secrets create GROQ_API_KEY --data-file=-
 echo -n "your-brave-key" | gcloud secrets create BRAVE_API_KEY --data-file=-
 echo -n "your-jwt-secret" | gcloud secrets create JWT_SECRET_KEY --data-file=-
-echo -n "your-huggingface-token" | gcloud secrets create HF_TOKEN --data-file=-
 
-# Database URL format: postgresql://postgres:PASSWORD@/frontshiftai?host=/cloudsql/PROJECT_ID:us-central1:frontshiftai-db
-echo -n "your-db-url" | gcloud secrets create DATABASE_URL --data-file=-
+# Paste the Neon connection string from Step 3 verbatim
+echo -n "your-neon-connection-string" | gcloud secrets create DATABASE_URL --data-file=-
 ```
+
+> `HF_TOKEN` is optional and not mounted by the deploy workflow; only create it if you need it for local/offline use.
 
 ---
 
@@ -120,16 +107,21 @@ gcloud iam workload-identity-pools create github-actions-pool \
     --display-name="GitHub Actions Pool"
 
 # Create Provider
+# --attribute-condition is required, not optional: Google rejects an OIDC
+# provider that uses a well-known public issuer with no condition. It is also
+# what stops any other repository on GitHub from impersonating this account,
+# so replace YOUR_GITHUB_USER/YOUR_REPO with your own repo.
 gcloud iam workload-identity-pools providers create-oidc github-provider \
     --workload-identity-pool="github-actions-pool" \
     --location="global" \
     --display-name="GitHub Provider" \
-    --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository" \
+    --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository,attribute.repository_owner=assertion.repository_owner" \
+    --attribute-condition="assertion.repository=='YOUR_GITHUB_USER/YOUR_REPO'" \
     --issuer-uri="https://token.actions.githubusercontent.com"
 
 # Allow GitHub Repo to impersonate Service Account
 # REPLACE 'YOUR_GITHUB_USER/YOUR_REPO' with your actual repo (e.g., 'johndoe/FrontShiftAI')
-gcloud iam service-accounts add-iam-policy-binding "github-actions-deploy@frontshiftai-deploy.iam.gserviceaccount.com" \
+gcloud iam service-accounts add-iam-policy-binding "github-actions-deploy@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
     --role="roles/iam.workloadIdentityUser" \
     --member="principalSet://iam.googleapis.com/projects/YOUR_PROJECT_NUMBER/locations/global/workloadIdentityPools/github-actions-pool/attribute.repository/YOUR_GITHUB_USER/YOUR_REPO"
 ```
@@ -138,53 +130,74 @@ gcloud iam service-accounts add-iam-policy-binding "github-actions-deploy@fronts
 Give the service account access to resources.
 
 ```bash
-SA_EMAIL="github-actions-deploy@frontshiftai-deploy.iam.gserviceaccount.com"
+SA_EMAIL="github-actions-deploy@YOUR_PROJECT_ID.iam.gserviceaccount.com"
 
-gcloud projects add-iam-policy-binding frontshiftai-deploy --member="serviceAccount:$SA_EMAIL" --role="roles/run.admin"
-gcloud projects add-iam-policy-binding frontshiftai-deploy --member="serviceAccount:$SA_EMAIL" --role="roles/storage.admin"
-gcloud projects add-iam-policy-binding frontshiftai-deploy --member="serviceAccount:$SA_EMAIL" --role="roles/artifactregistry.writer"
-gcloud projects add-iam-policy-binding frontshiftai-deploy --member="serviceAccount:$SA_EMAIL" --role="roles/iam.serviceAccountUser"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:$SA_EMAIL" --role="roles/run.admin"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:$SA_EMAIL" --role="roles/artifactregistry.writer"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:$SA_EMAIL" --role="roles/iam.serviceAccountUser"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:$SA_EMAIL" --role="roles/secretmanager.viewer"
 ```
+
+`roles/storage.admin` used to be on this list for the ChromaDB bucket. That bucket is gone (Step 2.2), so the role is no longer needed.
+
+### 2b. Let the Cloud Run runtime account read the secrets
+
+`deploy-backend.yml` does not pass `--service-account`, so the service runs as the Compute Engine default account. Without this the deploy fails, because a revision that cannot read a mounted secret never becomes ready.
+
+```bash
+PROJECT_NUMBER=$(gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)')
+RUNTIME_SA="$PROJECT_NUMBER-compute@developer.gserviceaccount.com"
+
+for S in GROQ_API_KEY BRAVE_API_KEY JWT_SECRET_KEY INCEPTION_API_KEY DATABASE_URL; do
+  gcloud secrets add-iam-policy-binding "$S" \
+    --member="serviceAccount:$RUNTIME_SA" \
+    --role="roles/secretmanager.secretAccessor" \
+    --project YOUR_PROJECT_ID
+done
+```
+
+That account only exists once `compute.googleapis.com` has been enabled, which is why it is in the API list in Step 1.
 
 ### 3. Configure GitHub Secrets
 Go to your GitHub Repository -> Settings -> Secrets and Variables -> Actions -> New Repository Secret.
 
 | Secret Name | Value |
 |-------------|-------|
-| `GCP_PROJECT_ID` | `frontshiftai-deploy` |
-| `GCP_SERVICE_ACCOUNT` | `github-actions-deploy@frontshiftai-deploy.iam.gserviceaccount.com` |
+| `GCP_PROJECT_ID` | `YOUR_PROJECT_ID` |
+| `GCP_SERVICE_ACCOUNT` | `github-actions-deploy@YOUR_PROJECT_ID.iam.gserviceaccount.com` |
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/YOUR_PROJECT_NUMBER/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider` |
-| `JWT_SECRET_KEY` | (Same as in Secret Manager) |
-| `VERCEL_TOKEN` | (If deploying frontend to Vercel) |
+
+`JWT_SECRET_KEY` is not a GitHub secret; it lives only in Secret Manager (Step 2.4).
+
+Also go to Settings -> Secrets and Variables -> Actions -> Variables and add these repository variables, which `deploy-backend.yml` and `deploy-pages.yml` read:
+
+| Variable Name | Value |
+|----------------|-------|
+| `DEPLOY_BACKEND_ENABLED` | Must be the literal string `true`, or the backend deploy job is skipped |
+| `BACKEND_URL` | Your deployed Cloud Run backend URL, baked into the chat app build |
+| `VOICE_API_URL` | Your voice API URL, baked into the chat app build |
 
 ---
 
 ## Step 4: Deploying Your Application
 
 ### Automatic Deployment
-1.  Push code to the `main` branch.
-2.  GitHub Actions will:
-    - Run Backend Tests (`test_backend.yml`)
-    - Run Frontend Tests (`test_frontend.yml`)
-    - If tests pass, deploy Backend (`deploy-backend.yml`)
-    - If tests pass, deploy Frontend (`deploy-frontend.yml`)
+1.  Push code to the `main` branch that touches backend paths, or trigger the workflow manually from the Actions tab.
+2.  GitHub Actions (`deploy-backend.yml`) deploys the backend to Cloud Run, but only if the `DEPLOY_BACKEND_ENABLED` repository variable is set to `true`; otherwise the deploy job is skipped.
+3.  The landing page and chat app are deployed separately, to GitHub Pages, by `.github/workflows/deploy-pages.yml`. There is no `deploy-frontend.yml`; it does not exist.
 
 ### Manual Deployment (from local machine)
-If you want to deploy without GitHub Actions:
+If you want to deploy the backend without GitHub Actions:
 
 ```bash
-# Backend
 gcloud run deploy frontshiftai-backend \
     --source backend/ \
     --region us-central1 \
     --allow-unauthenticated \
-    --set-secrets GROQ_API_KEY=GROQ_API_KEY:latest,DATABASE_URL=DATABASE_URL:latest
-
-# Frontend
-docker build -t gcr.io/frontshiftai-deploy/frontend ./frontend
-docker push gcr.io/frontshiftai-deploy/frontend
-gcloud run deploy frontshiftai-frontend --image gcr.io/frontshiftai-deploy/frontend --platform managed
+    --set-secrets GROQ_API_KEY=GROQ_API_KEY:latest,BRAVE_API_KEY=BRAVE_API_KEY:latest,JWT_SECRET_KEY=JWT_SECRET_KEY:latest,INCEPTION_API_KEY=INCEPTION_API_KEY:latest,DATABASE_URL=DATABASE_URL:latest
 ```
+
+The frontend is not deployed with `gcloud run` or Docker; it is static and published via GitHub Pages (`.github/workflows/deploy-pages.yml`).
 
 ---
 
@@ -201,6 +214,6 @@ gcloud run deploy frontshiftai-frontend --image gcr.io/frontshiftai-deploy/front
 
 ## Troubleshooting
 
-- **504 Gateway Timeout**: The backend might be taking too long to start (downloading ChromaDB). Increase timeout to 300s.
-- **Database Connection Error**: Ensure the Cloud Run service account has `roles/cloudsql.client` and the instance name is correct.
+- **504 Gateway Timeout**: The backend might be taking too long to start (loading the Chroma vector store baked into the image). Increase timeout to 300s.
+- **Database Connection Error**: Ensure the `DATABASE_URL` secret holds the full Neon connection string (with `sslmode=require`) and that the Neon project is active.
 - **Permission Denied**: Check IAM roles for the deployment service account.
