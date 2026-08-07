@@ -19,11 +19,17 @@ from agents.pto.agent import PTOAgent
 from agents.hr_ticket.agent import HRTicketAgent
 from agents.website_extraction.agent import WebsiteExtractionAgent
 from agents.utils.llm_client import AgentLLMClient, get_llm_client
+from agents.utils.checkpointer import (
+    conversation_owner,
+    purge_checkpoints_for_conversations,
+)
 from pydantic import BaseModel
 from schemas.rag import RAGQueryRequest
 from monitoring.production_logger import production_monitor
 import json
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["Unified Agent"])
 
@@ -228,7 +234,26 @@ async def unified_chat(
     start_time = time.time()
     
     # Create or get conversation
-    if not conversation_id:
+    if conversation_id:
+        # Phase 5.5F, belt to the checkpointer's braces. conversation_id arrives
+        # from the client and now selects a durable graph-state thread, so a
+        # caller must not be able to point at another tenant's conversation.
+        # This has to read around the Phase 0.6 auto-filter: an ORM lookup would
+        # narrow to the caller's own company and report someone else's
+        # conversation as simply absent.
+        #
+        # An id nobody owns is left alone rather than rejected, which keeps the
+        # pre-5.5 behaviour for clients that mint their own ids.
+        owner = conversation_owner(conversation_id)
+        if owner is not None and owner != company:
+            logger.warning(
+                "rejected chat turn targeting another tenant's conversation "
+                "id=%s owner=%s caller=%s",
+                conversation_id, owner, company,
+                extra={"audit": True, "event": "conversation_tenant_violation"},
+            )
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    else:
         conversation_id = str(uuid.uuid4())
         title = message[:50] + ('...' if len(message) > 50 else '')
         
@@ -269,9 +294,13 @@ async def unified_chat(
             result = await pto_agent.execute(
                 user_email=current_user["email"],
                 company=company,
-                message=message
+                message=message,
+                # Phase 5.5C: the whole of multi-turn resume is this argument.
+                # The agent derives a stable thread id from it, so a second turn
+                # continues the same durable graph state instead of restarting.
+                conversation_id=conversation_id,
             )
-            
+
             success = True
             
             # Log agent execution
@@ -317,9 +346,10 @@ async def unified_chat(
                 user_email=current_user["email"],
                 company=company,
                 message=message,
-                db=db
+                db=db,
+                conversation_id=conversation_id,  # Phase 5.5C
             )
-            
+
             success = True
             
             # Log agent execution
@@ -620,7 +650,19 @@ async def delete_conversation(
     # Delete conversation
     db.delete(conversation)
     db.commit()
-    
+
+    # Phase 5.5: the durable graph state is keyed by conversation id, so without
+    # this it would outlive the conversation and only be reclaimed by the daily
+    # cleanup task. Deliberately after the commit and non-fatal: the user asked
+    # to delete a conversation, and that has succeeded.
+    try:
+        purge_checkpoints_for_conversations([conversation_id])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not purge checkpoints for deleted conversation %s: %s",
+            conversation_id, exc,
+        )
+
     return {"message": "Conversation deleted"}
 
 

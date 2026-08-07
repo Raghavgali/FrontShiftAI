@@ -1,6 +1,29 @@
 """
 HR Ticket Agent - LangGraph Workflow
+
+Phase 5.5B note
+---------------
+Until Phase 5.5 this class compiled a graph in ``__init__`` and then never used
+it: ``process_message`` re-implemented the same node sequence by hand, because
+the nodes take ``(state, db)`` and the graph was built with bare one-argument
+node references. That compiled graph could not even be invoked (it raised
+``TypeError: parse_intent_node() missing 1 required positional argument: 'db'``),
+so attaching a checkpointer to it would have checkpointed nothing.
+
+The nodes are now bound to the session the same way the PTO agent binds them,
+and the graph is what actually runs. The edges are unchanged from the ones that
+were already declared, and they match the old manual sequence step for step;
+``HRTicketState`` has no reducer annotations, so LangGraph's channel merge is
+last-write-wins, which is exactly what sequential ``state = node(state, db)``
+assignment did.
+
+Because the graph closes over a request-scoped ``Session``, it is compiled per
+call rather than cached. That is the same trade-off the PTO agent already makes,
+and caching would risk running a node against a closed session.
 """
+import logging
+from typing import Any, Dict, Optional
+
 from langgraph.graph import StateGraph, END
 from agents.hr_ticket.state import HRTicketState
 from agents.hr_ticket.nodes import (
@@ -10,7 +33,15 @@ from agents.hr_ticket.nodes import (
     create_ticket_node,
     generate_response_node
 )
+from agents.utils.checkpointer import (
+    HR_THREAD_PREFIX,
+    CheckpointTenantMismatch,
+    get_checkpointer,
+    thread_id_for,
+)
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 
 class HRTicketAgent:
@@ -26,19 +57,20 @@ class HRTicketAgent:
     """
     
     def __init__(self):
-        self.graph = self._build_graph()
-    
-    def _build_graph(self):
-        """Build the LangGraph workflow"""
+        # Phase 5.5A: process-wide, lazily built. None when checkpointing is off.
+        self.checkpointer = get_checkpointer()
+
+    def _build_graph(self, db: Session):
+        """Build the LangGraph workflow with ``db`` bound into every node."""
         workflow = StateGraph(HRTicketState)
-        
+
         # Add nodes
-        workflow.add_node("parse_intent", parse_intent_node)
-        workflow.add_node("validate_request", validate_request_node)
-        workflow.add_node("check_duplicates", check_duplicates_node)
-        workflow.add_node("create_ticket", create_ticket_node)
-        workflow.add_node("generate_response", generate_response_node)
-        
+        workflow.add_node("parse_intent", lambda state: parse_intent_node(state, db))
+        workflow.add_node("validate_request", lambda state: validate_request_node(state, db))
+        workflow.add_node("check_duplicates", lambda state: check_duplicates_node(state, db))
+        workflow.add_node("create_ticket", lambda state: create_ticket_node(state, db))
+        workflow.add_node("generate_response", lambda state: generate_response_node(state, db))
+
         # Define flow
         workflow.set_entry_point("parse_intent")
         
@@ -63,9 +95,28 @@ class HRTicketAgent:
         
         # End after response
         workflow.add_edge("generate_response", END)
-        
-        return workflow.compile()
-    
+
+        compile_kwargs: Dict[str, Any] = {}
+        if self.checkpointer is not None:
+            compile_kwargs["checkpointer"] = self.checkpointer
+        return workflow.compile(**compile_kwargs)
+
+    @staticmethod
+    def thread_config(conversation_id: Optional[str]) -> Dict[str, Any]:
+        """LangGraph config pinning this run to the conversation's thread.
+
+        Unlike the PTO agent, HR does not carry slots across turns. A ticket is
+        a single-shot artefact, so remembering a half-filled subject or
+        description would risk filing a ticket the user did not ask for on a
+        later turn. What the durable thread buys HR is state that outlives the
+        request: a replayable history, and a run that could be resumed.
+        """
+        return {
+            "configurable": {
+                "thread_id": thread_id_for(HR_THREAD_PREFIX, conversation_id)
+            }
+        }
+
     def _validation_router(self, state: HRTicketState) -> str:
         """Route based on validation result"""
         if state["is_valid"]:
@@ -78,59 +129,46 @@ class HRTicketAgent:
         user_email: str,
         company: str,
         message: str,
-        db: Session
+        db: Session,
+        conversation_id: Optional[str] = None,
     ) -> dict:
         """
         Process a user message and create an HR ticket.
-        
+
         Args:
             user_email: Email of the user
             company: User's company
             message: User's message
             db: Database session
-        
+            conversation_id: Chat thread this turn belongs to. Supplying it
+                makes graph state durable across turns (Phase 5.5).
+
         Returns:
             dict with response and ticket info
         """
-        # Initialize state
         initial_state = self._initial_state(user_email, company, message)
+        graph = self._build_graph(db)
+        config = self.thread_config(conversation_id)
 
-        # Run the workflow
-        # Pass db to each node via config
-        config = {"configurable": {"db": db}}
-        
-        # Since nodes need db, we'll invoke with a wrapper
-        final_state = None
-        current_state = initial_state
-        
-        # Manually execute nodes with db
         try:
-            # Parse intent
-            current_state = parse_intent_node(current_state, db)
-            
-            # Validate
-            current_state = validate_request_node(current_state, db)
-            
-            # If valid, continue
-            if current_state["is_valid"]:
-                # Check duplicates
-                current_state = check_duplicates_node(current_state, db)
-                
-                # Create ticket
-                current_state = create_ticket_node(current_state, db)
-            
-            # Generate response
-            current_state = generate_response_node(current_state, db)
-            
-            final_state = current_state
-            
+            final_state = await graph.ainvoke(initial_state, config=config)
+        except CheckpointTenantMismatch:
+            # Security boundary: never answer from another tenant's state.
+            raise
         except Exception as e:
-            print(f"Error in workflow: {e}")
-            final_state = current_state
+            logger.error("Error in HR ticket workflow: %s", e)
+            # Preserve the pre-5.5 contract: report the failure with whatever
+            # the run managed to persist, rather than propagating.
+            final_state = dict(initial_state)
+            if self.checkpointer is not None:
+                try:
+                    partial = await graph.aget_state(config)
+                    final_state.update(getattr(partial, "values", None) or {})
+                except Exception:  # noqa: BLE001 - best effort only
+                    pass
             final_state["agent_response"] = "I'm sorry, there was an error processing your request. Please try again."
             final_state["is_valid"] = False
-        
-        # Return result
+
         return self._result_from_state(final_state)
 
     @staticmethod
@@ -174,37 +212,36 @@ class HRTicketAgent:
         user_email: str,
         company: str,
         message: str,
-        db: Session
+        db: Session,
+        conversation_id: Optional[str] = None,
     ):
         """
         Process a user message, streaming per-node progress.
 
-        Mirrors process_message's manual node sequence (the compiled graph is
-        not used because the nodes need the db session). Yields ("status",
-        payload) before each node runs, then ("done", result) with the same
-        shape as process_message().
+        Streams the checkpointed graph, mirroring ``PTOAgent.execute_stream``.
+        Yields ("status", payload) as each node completes, then ("done", result)
+        with the same shape as process_message().
+
+        Note the change in timing from the pre-5.5 version: a status event now
+        arrives *after* its node finishes rather than before it starts, which is
+        what ``stream_mode="updates"`` reports and what the PTO stream already
+        did. The stage names are unchanged.
         """
-        state = self._initial_state(user_email, company, message)
+        state: Dict[str, Any] = dict(self._initial_state(user_email, company, message))
+        graph = self._build_graph(db)
+        config = self.thread_config(conversation_id)
 
         try:
-            yield "status", {"stage": "parse_intent"}
-            state = parse_intent_node(state, db)
+            async for update in graph.astream(state, config=config, stream_mode="updates"):
+                for node_name, delta in update.items():
+                    if isinstance(delta, dict):
+                        state.update(delta)
+                    yield "status", {"stage": node_name}
 
-            yield "status", {"stage": "validate_request"}
-            state = validate_request_node(state, db)
-
-            if state["is_valid"]:
-                yield "status", {"stage": "check_duplicates"}
-                state = check_duplicates_node(state, db)
-
-                yield "status", {"stage": "create_ticket"}
-                state = create_ticket_node(state, db)
-
-            yield "status", {"stage": "generate_response"}
-            state = generate_response_node(state, db)
-
+        except CheckpointTenantMismatch:
+            raise
         except Exception as e:
-            print(f"Error in workflow: {e}")
+            logger.error("Error in HR ticket workflow: %s", e)
             state["agent_response"] = "I'm sorry, there was an error processing your request. Please try again."
             state["is_valid"] = False
 

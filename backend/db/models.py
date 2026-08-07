@@ -2,7 +2,7 @@
 SQLAlchemy database models
 """
 import uuid
-from sqlalchemy import Column, String, DateTime, Enum, Integer, Float, Boolean, Date, Text, UniqueConstraint, PrimaryKeyConstraint
+from sqlalchemy import Column, String, DateTime, Enum, Integer, Float, Boolean, Date, Text, LargeBinary, UniqueConstraint, PrimaryKeyConstraint
 from db.connection import Base
 from datetime import datetime, timezone
 import enum
@@ -279,3 +279,84 @@ class RefreshToken(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     revoked_at = Column(DateTime, nullable=True)
     rotated_from = Column(String, nullable=True)  # previous token.id in the chain
+
+
+# ==========================================
+# PHASE 5.5: DURABLE LANGGRAPH CHECKPOINTS
+# ==========================================
+#
+# These two tables are the storage behind
+# ``agents.utils.checkpointer.SqlAlchemyCheckpointSaver``. Column names and
+# primary keys deliberately mirror LangGraph's own SqliteSaver/PostgresSaver
+# schema so the layout stays recognisable to anyone who knows the library, but
+# they are declared here (rather than created by a saver's ``.setup()``)
+# because this repo has no Alembic: every table comes from
+# ``Base.metadata.create_all()``.
+#
+# There is deliberately no ``company`` column. Ownership of a checkpoint is
+# derived from the conversation its ``thread_id`` points at
+# (``Conversation.company``), which keeps a single source of truth for
+# tenancy. A denormalised copy here could drift, and the Phase 0.6 auto-filter
+# would not enforce it anyway: the saver reads through SQLAlchemy Core, and the
+# ``before_compile`` listener only hooks the ORM ``Query`` API.
+
+class LangGraphCheckpoint(Base):
+    """One durable LangGraph checkpoint (a snapshot of graph channel values).
+
+    ``checkpoint`` and ``checkpoint_metadata`` are opaque blobs produced by
+    LangGraph's serialiser. Nothing outside the saver should try to read them.
+    """
+    __tablename__ = "langgraph_checkpoints"
+
+    thread_id = Column(String, primary_key=True)
+    checkpoint_ns = Column(String, primary_key=True, default="", server_default="")
+    checkpoint_id = Column(String, primary_key=True)
+
+    parent_checkpoint_id = Column(String, nullable=True)
+    type = Column(String, nullable=True)
+    checkpoint = Column(LargeBinary, nullable=True)
+    # Named ``checkpoint_metadata`` and not ``metadata``: ``metadata`` is
+    # reserved on declarative classes (it is the MetaData registry).
+    checkpoint_metadata = Column(LargeBinary, nullable=True)
+
+    # Used by the Phase 5.5E cleanup task to expire orphaned and ad-hoc
+    # threads, which by definition have no Conversation row to age out.
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True,
+    )
+
+
+class LangGraphCheckpointWrite(Base):
+    """Pending intermediate writes for a checkpoint.
+
+    LangGraph records a task's channel writes here before they are folded into
+    the next checkpoint. They are what makes an interrupted graph resumable.
+    """
+    __tablename__ = "langgraph_checkpoint_writes"
+
+    thread_id = Column(String, primary_key=True)
+    checkpoint_ns = Column(String, primary_key=True, default="", server_default="")
+    checkpoint_id = Column(String, primary_key=True)
+    task_id = Column(String, primary_key=True)
+    idx = Column(Integer, primary_key=True)
+
+    channel = Column(String, nullable=False)
+    type = Column(String, nullable=True)
+    value = Column(LargeBinary, nullable=True)
+
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True,
+    )
+
+# No separate index on thread_id: it is the leading column of each composite
+# primary key, so the PK's btree already serves ``WHERE thread_id = ?`` and
+# ``WHERE thread_id IN (...)``, which is every lookup these tables get. The
+# ``updated_at`` index above is the one that is not implied.
