@@ -190,6 +190,78 @@ def purge_stale_idempotency_records():
         db.close()
 
 
+CHECKPOINT_RETENTION_DAYS = int(os.getenv("CHECKPOINT_RETENTION_DAYS", "30"))
+
+
+@celery_app.task
+def cleanup_stale_checkpoints(retention_days: int = None):
+    """Phase 5.5E: drop durable LangGraph state for dormant conversations.
+
+    A checkpoint exists to let a conversation resume. Once a conversation has
+    been dormant for the retention window nobody is going to resume it, and the
+    rows are just a growing pile of serialised graph state in Neon.
+
+    Two passes, because not every thread has a conversation to age out:
+
+    1. Conversations whose ``updated_at`` is older than the cutoff. This is the
+       rule the plan asks for. Thread ids are enumerated exactly per
+       conversation, never matched with ``LIKE``, so a conversation id
+       containing a wildcard character cannot widen the delete.
+    2. Any remaining thread whose newest checkpoint predates the cutoff. This
+       catches the threads pass 1 cannot see: the disposable threads minted by
+       the standalone ``/api/pto/chat`` and ``/api/hr-ticket/chat`` routes, and
+       orphans left by a conversation deleted before this task existed.
+
+    Cross-tenant by nature, so the Conversation scan runs under
+    ``bypass_tenant_filter``: it must see every tenant's dormant conversations,
+    and the bypass is what puts that on the audit trail.
+
+    **Not running in production yet.** Redis is not provisioned, so neither the
+    Celery worker nor beat is deployed. Until they are, this has to be invoked
+    by hand, and checkpoint rows accumulate. That is bounded by conversation
+    volume rather than unbounded, but it is a real gap.
+    """
+    from agents.utils.checkpointer import (
+        purge_checkpoints_for_conversations,
+        purge_checkpoints_older_than,
+    )
+    from db.models import Conversation
+    from db.tenant_context import bypass_tenant_filter
+
+    days = CHECKPOINT_RETENTION_DAYS if retention_days is None else retention_days
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    db: Session = SessionLocal()
+    try:
+        with bypass_tenant_filter(
+            reason=f"scheduled checkpoint cleanup, retention={days}d",
+            actor="jobs.tasks.cleanup_stale_checkpoints",
+        ):
+            stale_ids = [
+                row[0]
+                for row in db.query(Conversation.id)
+                .filter(Conversation.updated_at < cutoff)
+                .all()
+            ]
+    finally:
+        db.close()
+
+    by_conversation = purge_checkpoints_for_conversations(stale_ids)
+    orphaned = purge_checkpoints_older_than(cutoff)
+
+    logger.info(
+        "cleanup_stale_checkpoints: retention=%dd conversations=%d "
+        "checkpoints_by_conversation=%d checkpoints_orphaned=%d",
+        days, len(stale_ids), by_conversation, orphaned,
+    )
+    return {
+        "retention_days": days,
+        "stale_conversations": len(stale_ids),
+        "deleted_by_conversation": by_conversation,
+        "deleted_orphaned": orphaned,
+    }
+
+
 @celery_app.task(bind=True)
 def process_delete_company_task(self, task_id: str, company_name: str):
     """

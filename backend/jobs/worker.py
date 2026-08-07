@@ -27,4 +27,13 @@ celery_app.conf.beat_schedule = {
         "task": "jobs.tasks.purge_stale_idempotency_records",
         "schedule": crontab(hour=3, minute=15),
     },
+    "cleanup-stale-checkpoints": {
+        # Phase 5.5E: drop LangGraph checkpoints for conversations dormant for
+        # CHECKPOINT_RETENTION_DAYS (30), daily at 03:45 UTC. Offset from the
+        # idempotency purge so the two are not competing for the same
+        # connections. Not actually scheduled in production yet: Redis is not
+        # provisioned, so neither beat nor the worker is deployed.
+        "task": "jobs.tasks.cleanup_stale_checkpoints",
+        "schedule": crontab(hour=3, minute=45),
+    },
 }
