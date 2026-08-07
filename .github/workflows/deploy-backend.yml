@@ -125,7 +125,7 @@ jobs:
             --region ${{ env.REGION }} \
             --allow-unauthenticated \
             --set-env-vars ENVIRONMENT=production,GENERATION_BACKEND=mercury \
-            --set-secrets GROQ_API_KEY=GROQ_API_KEY:latest,BRAVE_API_KEY=BRAVE_API_KEY:latest,JWT_SECRET_KEY=JWT_SECRET_KEY:latest,INCEPTION_API_KEY=INCEPTION_API_KEY:latest,DATABASE_URL=DATABASE_URL:latest \
+            --set-secrets GROQ_API_KEY=GROQ_API_KEY:latest,BRAVE_API_KEY=BRAVE_API_KEY:latest,JWT_SECRET_KEY=JWT_SECRET_KEY:latest,INCEPTION_API_KEY=INCEPTION_API_KEY:latest,DATABASE_URL=DATABASE_URL:latest,SEED_SUPER_ADMIN_PASSWORD=SEED_SUPER_ADMIN_PASSWORD:latest,SEED_ADMIN_PASSWORD=SEED_ADMIN_PASSWORD:latest,SEED_USER_PASSWORD=SEED_USER_PASSWORD:latest,SEED_DEMO_PASSWORD=SEED_DEMO_PASSWORD:latest \
             --clear-cloudsql-instances \
             --memory 2Gi \
             --cpu 2 \

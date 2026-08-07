@@ -39,3 +39,44 @@ def test_seed_initial_data(test_db):
 
     finally:
         db.seed.SessionLocal = original_session
+
+
+def test_production_seed_requires_explicit_passwords(test_db, monkeypatch):
+    """A fresh production database must not get default passwords."""
+    import db.seed
+    monkeypatch.setattr(db.seed, "SessionLocal", lambda: test_db)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    for var in (
+        "SEED_SUPER_ADMIN_PASSWORD",
+        "SEED_ADMIN_PASSWORD",
+        "SEED_USER_PASSWORD",
+        "SEED_DEMO_PASSWORD",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    with pytest.raises(RuntimeError, match="SEED_SUPER_ADMIN_PASSWORD"):
+        seed_initial_data()
+
+
+def test_seeded_production_startup_does_not_need_seed_passwords(test_db, monkeypatch):
+    """The already-seeded path must not touch seed credentials.
+
+    seed_initial_data runs on every startup. Resolving the passwords before
+    the "already seeded" check made every cold start in production depend on
+    env vars that only matter once, which crash-looped the service.
+    """
+    import db.seed
+    monkeypatch.setattr(db.seed, "SessionLocal", lambda: test_db)
+
+    seed_initial_data()  # seed once, with development defaults
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    for var in (
+        "SEED_SUPER_ADMIN_PASSWORD",
+        "SEED_ADMIN_PASSWORD",
+        "SEED_USER_PASSWORD",
+        "SEED_DEMO_PASSWORD",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    seed_initial_data()  # must be a no-op, not a RuntimeError

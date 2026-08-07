@@ -34,26 +34,27 @@ def _seed_password(env_var: str, dev_default: str) -> str:
 
 def seed_initial_data(db_session=None):
     """Seed database with initial companies and users"""
-    # Resolve credentials before opening a session so a misconfigured
-    # production deploy fails loudly instead of being swallowed below.
-    super_admin_email = os.getenv("SEED_SUPER_ADMIN_EMAIL", "admin@frontshiftai.com")
-    super_admin_password = _seed_password("SEED_SUPER_ADMIN_PASSWORD", "admin123")
-    admin_password = _seed_password("SEED_ADMIN_PASSWORD", "admin123")
-    user_password = _seed_password("SEED_USER_PASSWORD", "password123")
-    demo_password = _seed_password("SEED_DEMO_PASSWORD", "demo1234")
-    current_year = date.today().year
-
     db = db_session if db_session else SessionLocal()
 
     try:
-        # Check if already seeded
+        # Check if already seeded first. This function runs on every startup,
+        # and only a genuinely empty database needs seed credentials, so
+        # resolving them up front would make every cold start in production
+        # depend on env vars that matter exactly once.
         existing_companies = db.query(Company).count()
         if existing_companies > 0:
             print("Database already seeded, skipping...")
             return
-        
+
+        super_admin_email = os.getenv("SEED_SUPER_ADMIN_EMAIL", "admin@frontshiftai.com")
+        super_admin_password = _seed_password("SEED_SUPER_ADMIN_PASSWORD", "admin123")
+        admin_password = _seed_password("SEED_ADMIN_PASSWORD", "admin123")
+        user_password = _seed_password("SEED_USER_PASSWORD", "password123")
+        demo_password = _seed_password("SEED_DEMO_PASSWORD", "demo1234")
+        current_year = date.today().year
+
         print("🌱 Seeding database...")
-        
+
         # Add Companies
         companies_data = [
             {"name": "Crouse Medical Practice", "domain": "Healthcare", "email_domain": "crousemedical.com", "url": "https://crousemed.com/media/1449/cmp-employee-handbook.pdf"},
@@ -167,6 +168,12 @@ def seed_initial_data(db_session=None):
         db.commit()
         print("✅ Database seeded successfully!")
         
+    except RuntimeError:
+        # Missing production seed credentials is a configuration error, not a
+        # transient failure. Let it surface instead of starting a server whose
+        # database has no users at all.
+        db.rollback()
+        raise
     except Exception as e:
         print(f"❌ Error seeding database: {e}")
         db.rollback()
